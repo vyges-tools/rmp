@@ -20,6 +20,12 @@ vyges physical rmp — logic restructuring on an AIG: re-synthesis of timing-cri
 
 USAGE:
   vyges physical rmp run  <design.odb> <job> -o OUT.odb  re-synthesise a region for area or delay
+  vyges physical rmp blif-write <design.odb> --liberty FILE... --inst NAME... -o OUT.blif
+                         [--const0 CELL PORT] [--const1 CELL PORT]
+                                                  the instances as a BLIF cut
+  vyges physical rmp blif-read  <design.odb> --liberty FILE... --inst NAME... --blif FILE -o OUT.odb
+                         [--const0 CELL PORT] [--const1 CELL PORT] [--call-id N]
+                                                  replace the instances by the BLIF's gates
   vyges physical rmp --describe
   vyges physical rmp --help
   vyges physical rmp --version
@@ -41,7 +47,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run"];
+pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -49,7 +55,7 @@ const DESCRIBE: &str = r#"{
   "summary": "Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "No command is implemented yet: every command refuses with exit 3."
+    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `run` refuses with exit 3."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -64,6 +70,166 @@ fn refuse(what: &str) -> ExitCode {
             .with_code("RMP-REFUSED"),
     );
     ExitCode::from(3)
+}
+
+fn input_error(msg: &str) -> ExitCode {
+    vyges_events::emit(&vyges_events::Event::new("vyges-rmp", vyges_events::Severity::Error, msg.to_string()).with_code("RMP-INPUT"));
+    ExitCode::from(2)
+}
+
+fn usage_error(msg: &str) -> ExitCode {
+    eprintln!("vyges-rmp: {msg}\n\n{USAGE}");
+    ExitCode::from(2)
+}
+
+fn refused(why: String) -> ExitCode {
+    vyges_events::emit(&vyges_events::Event::new("vyges-rmp", vyges_events::Severity::Error, why).with_code("RMP-REFUSED"));
+    ExitCode::from(3)
+}
+
+/// What the BLIF commands share: the design, its libraries, the instances, the constant cells.
+struct BlifArgs {
+    design: String,
+    liberty: Vec<String>,
+    insts: Vec<String>,
+    consts: vyges_rmp::cut::blif::ConstCells,
+    blif: Option<String>,
+    call_id: i32,
+    out: String,
+}
+
+fn blif_args(cmd: &str, args: &[String]) -> Result<BlifArgs, ExitCode> {
+    let mut a = BlifArgs { design: String::new(), liberty: Vec::new(), insts: Vec::new(), consts: Default::default(), blif: None, call_id: 1, out: String::new() };
+    let mut pos = Vec::new();
+    let mut it = args.iter();
+    while let Some(f) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| usage_error(&format!("{f} needs a value")));
+        match f.as_str() {
+            "--liberty" => a.liberty.push(value()?),
+            "--inst" => a.insts.push(value()?),
+            "--blif" => a.blif = Some(value()?),
+            "-o" => a.out = value()?,
+            "--call-id" => {
+                let v = value()?;
+                a.call_id = v.parse().map_err(|_| usage_error(&format!("--call-id needs a number, not `{v}`")))?;
+            }
+            "--const0" => {
+                a.consts.const0_cell = value()?;
+                a.consts.const0_port = value()?;
+            }
+            "--const1" => {
+                a.consts.const1_cell = value()?;
+                a.consts.const1_port = value()?;
+            }
+            "-q" | "--quiet" | "-v" | "--verbose" => {}
+            o if o.starts_with('-') => return Err(usage_error(&format!("unknown option `{o}`"))),
+            o => pos.push(o.to_string()),
+        }
+    }
+    match <[String; 1]>::try_from(pos) {
+        Ok([d]) if !a.out.is_empty() => a.design = d,
+        _ => return Err(usage_error(&format!("{cmd} needs a design database and -o OUT"))),
+    }
+    Ok(a)
+}
+
+/// The libraries as the design sees them: a cell resolves to the FIRST library that has it.
+fn read_libraries(files: &[String]) -> Result<vyges_sta::liberty::Library, ExitCode> {
+    let mut merged: Option<vyges_sta::liberty::Library> = None;
+    for f in files {
+        let lib = std::fs::read_to_string(f)
+            .map_err(|e| e.to_string())
+            .and_then(|text| vyges_sta::liberty_parse::parse(&text))
+            .and_then(|g| vyges_sta::liberty::Library::read(&g))
+            .map_err(|e| input_error(&format!("cannot read {f}: {e}")))?;
+        match &mut merged {
+            None => merged = Some(lib),
+            Some(m) => {
+                for (name, cell) in lib.cells {
+                    m.cells.entry(name).or_insert(cell);
+                }
+            }
+        }
+    }
+    Ok(merged.unwrap_or_default())
+}
+
+fn blif_error(e: vyges_rmp::cut::blif::BlifError) -> ExitCode {
+    match e {
+        vyges_rmp::cut::blif::BlifError::Error(line) => {
+            println!("{line}");
+            ExitCode::from(1)
+        }
+        vyges_rmp::cut::blif::BlifError::Refused(why) => refused(why),
+    }
+}
+
+/// `writeBlif`: the instances as a BLIF file. Log lines are the reference's.
+fn blif_write(args: &[String]) -> ExitCode {
+    let mut a = match blif_args("blif-write", args) {
+        Ok(a) => a,
+        Err(c) => return c,
+    };
+    let lib = match read_libraries(&a.liberty) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let mut db = match vyges_opendb::Db::open(&a.design) {
+        Ok(db) => db,
+        Err(e) => return input_error(&format!("cannot read {}: {e}", a.design)),
+    };
+    if let Some(i) = a.insts.iter().find(|i| db.inst_master(i).is_empty()) {
+        return input_error(&format!("no instance {i}"));
+    }
+    let d = vyges_rmp::design::OdbBlif { db: &mut db };
+    let w = match vyges_rmp::cut::blif::write_blif(&d, &lib, &a.insts, &mut a.consts) {
+        Ok(w) => w,
+        Err(e) => return blif_error(e),
+    };
+    if let Err(e) = std::fs::write(&a.out, &w.text) {
+        return input_error(&format!("cannot write {}: {e}", a.out));
+    }
+    println!("[INFO CUT-0002] Blif writer successfully dumped file with {} instances.", w.instances);
+    ExitCode::SUCCESS
+}
+
+/// `readBlif`: the instances replaced by the file's gates. Log lines are the reference's.
+fn blif_read(args: &[String]) -> ExitCode {
+    let a = match blif_args("blif-read", args) {
+        Ok(a) => a,
+        Err(c) => return c,
+    };
+    let Some(blif) = &a.blif else { return usage_error("blif-read needs --blif FILE") };
+    let text = match std::fs::read(blif) {
+        Ok(t) => t,
+        Err(e) => return input_error(&format!("cannot read {blif}: {e}")),
+    };
+    let lib = match read_libraries(&a.liberty) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    let mut db = match vyges_opendb::Db::open(&a.design) {
+        Ok(db) => db,
+        Err(e) => return input_error(&format!("cannot read {}: {e}", a.design)),
+    };
+    if let Some(i) = a.insts.iter().find(|i| db.inst_master(i).is_empty()) {
+        return input_error(&format!("no instance {i}"));
+    }
+    let mut log = Vec::new();
+    let r = {
+        let mut d = vyges_rmp::design::OdbBlif { db: &mut db };
+        vyges_rmp::cut::blif::read_blif(&mut d, &lib, &a.insts, &a.consts, a.call_id, &text, &mut log)
+    };
+    for l in &log {
+        println!("{l}");
+    }
+    if let Err(e) = r {
+        return blif_error(e);
+    }
+    if let Err(e) = db.write(&a.out) {
+        return input_error(&format!("cannot write {}: {e}", a.out));
+    }
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
@@ -82,6 +248,8 @@ fn main() -> ExitCode {
             println!("{DESCRIBE}");
             ExitCode::SUCCESS
         }
+        Some("blif-write") => blif_write(&args[1..]),
+        Some("blif-read") => blif_read(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-rmp: unknown command `{other}`\n\n{USAGE}");
