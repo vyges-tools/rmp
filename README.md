@@ -2,8 +2,8 @@
 
 Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.
 
-> **Status: in development.** `restructure -target area`, `blif-write` and `blif-read` are built;
-> `restructure -target timing` and `run` refuse with exit 3. Commands are enabled one at a time as
+> **Status: in development.** `restructure` (area and timing targets), `blif-write` and `blif-read` are built;
+> `run` refuses with exit 3. Commands are enabled one at a time as
 > each is validated.
 
 ## Why this exists

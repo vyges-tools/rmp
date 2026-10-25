@@ -104,9 +104,56 @@ pub struct Written {
     pub instances: usize,
 }
 
-/// `writeBlif` (arrivals and requireds not written). `insts` in any order: they are taken in id
-/// order, as the reference's pointer set holds them.
+/// The timer's times for `writeBlif(…, write_arrival_requireds = true)`: a pin's (`inst/term`, or
+/// a port's name) arrival and required time, (rise, fall), in seconds — 0 where it has none.
+pub struct Times<'a> {
+    pub arrival: &'a dyn Fn(&str) -> [f32; 2],
+    pub required: &'a dyn Fn(&str) -> [f32; 2],
+}
+
+/// `writeBlif` without arrivals and requireds. `insts` in any order: they are taken in id order,
+/// as the reference's pointer set holds them.
 pub fn write_blif(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &mut ConstCells) -> Result<Written, BlifError> {
+    write_blif_timed(d, lib, insts, consts, None)
+}
+
+/// A float as `std::ostream` prints it by default (`%g`, six significant digits).
+pub fn fmt_g(v: f64) -> String {
+    if v == 0.0 || !v.is_finite() {
+        return if v == 0.0 { "0".into() } else { format!("{v}") };
+    }
+    let exp = v.abs().log10().floor() as i32;
+    // `%e` with 5 decimals gives the exponent after rounding.
+    let e = format!("{v:.5e}");
+    let exp = e.split_once('e').and_then(|(_, x)| x.parse::<i32>().ok()).unwrap_or(exp);
+    let trim = |t: String| if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t };
+    if !(-4..6).contains(&exp) {
+        let (m, _) = e.split_once('e').unwrap_or((&e, ""));
+        format!("{}e{}{:02}", trim(m.to_string()), if exp < 0 { '-' } else { '+' }, exp.abs())
+    } else {
+        trim(format!("{v:.*}", (5 - exp).max(0) as usize))
+    }
+}
+
+/// `writeBlif`; with `times`, each boundary net's arrival (an input) or required time (an output)
+/// as the reference collects them: the first pin to name a net gives its value — the instance's
+/// own terminal, except an input PORT, whose own pin does.
+pub fn write_blif_timed(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &mut ConstCells, times: Option<&Times>) -> Result<Written, BlifError> {
+    let mut arrivals: BTreeMap<String, [f32; 2]> = BTreeMap::new();
+    let mut requireds: BTreeMap<String, [f32; 2]> = BTreeMap::new();
+    // `addArrival` / `addRequired`: the first value for a net stands; seconds to picoseconds as
+    // the reference multiplies (`float * 1e12`, kept as a float).
+    let ps = |t: [f32; 2]| t.map(|x| (f64::from(x) * 1e12) as f32);
+    let mut add_arrival = |pin: &str, net: &str| {
+        if let Some(t) = times {
+            arrivals.entry(net.to_string()).or_insert_with(|| ps((t.arrival)(pin)));
+        }
+    };
+    let mut add_required = |pin: &str, net: &str| {
+        if let Some(t) = times {
+            requireds.entry(net.to_string()).or_insert_with(|| ps((t.required)(pin)));
+        }
+    };
     let mut insts: Vec<&String> = insts.iter().collect::<BTreeSet<_>>().into_iter().collect();
     insts.sort_by_key(|i| d.inst_id(i));
     let in_cut: BTreeSet<&str> = insts.iter().map(|i| i.as_str()).collect();
@@ -144,11 +191,14 @@ pub fn write_blif(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &
             let Some(net) = &iterm.net else { continue };
             // An input or output when the net reaches only this terminal, or a terminal outside.
             let connected = d.net_iterms(net);
+            let pin = format!("{inst}/{}", iterm.mterm);
             if connected.len() == 1 {
                 if iterm.io_type == "INPUT" {
                     inputs.insert(net_name.clone());
+                    add_arrival(&pin, &net_name);
                 } else if iterm.io_type == "OUTPUT" {
                     outputs.insert(net_name.clone());
+                    add_required(&pin, &net_name);
                 }
             } else {
                 let mut add_as_input = false;
@@ -179,20 +229,24 @@ pub fn write_blif(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &
                         }
                     } else if iterm.io_type == "OUTPUT" {
                         outputs.insert(net_name.clone());
+                        add_required(&pin, &net_name);
                     }
                 }
                 if add_as_input && !const0.contains(&net_name) && !const1.contains(&net_name) {
                     inputs.insert(net_name.clone());
+                    add_arrival(&pin, &net_name);
                 }
             }
             // The design's own ports, where the net is none of these yet. (A top port has no
             // Liberty port, so an input port is an input.)
             if !inputs.contains(&net_name) && !outputs.contains(&net_name) && !const0.contains(&net_name) && !const1.contains(&net_name) {
-                for (_, io) in d.net_bterms(net) {
+                for (port, io) in d.net_bterms(net) {
                     if io == "INPUT" {
                         inputs.insert(net_name.clone());
+                        add_arrival(&port, &net_name);
                     } else if io == "OUTPUT" {
                         outputs.insert(net_name.clone());
+                        add_required(&pin, &net_name);
                     }
                 }
             }
@@ -211,6 +265,7 @@ pub fn write_blif(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &
     let common: Vec<String> = inputs.intersection(&outputs).cloned().collect();
     for p in common {
         inputs.remove(&p);
+        arrivals.remove(&p);
     }
     let mut f = String::from(".model tmp_circuit\n.inputs");
     for input in &inputs {
@@ -229,6 +284,14 @@ pub fn write_blif(d: &dyn BlifDesign, lib: &Library, insts: &[String], consts: &
         f += ".clock";
         for clock in &clocks {
             f += &format!(" {clock}");
+        }
+    }
+    if times.is_some() {
+        for (net, [r, fa]) in &arrivals {
+            f += &format!(".input_arrival {net} {} {}\n", fmt_g(f64::from(*r)), fmt_g(f64::from(*fa)));
+        }
+        for (net, [r, fa]) in &requireds {
+            f += &format!(".output_required {net} {} {}\n", fmt_g(f64::from(*r)), fmt_g(f64::from(*fa)));
         }
     }
     f += "\n\n";
@@ -758,6 +821,66 @@ mod tests {
             ".model tmp_circuit\n.inputs n3\n.outputs n6\n\n\n.gate AND2 A=dummy_0 B=dummy_1 Z=n5\n.gate AND2 A=n3 B=n5 Z=n6\n.end\n"
         );
         assert_eq!(w.instances, 2);
+    }
+
+    #[test]
+    fn timed_nets_take_the_first_pins_time_and_an_input_port_its_own() {
+        // Rules (`writeBlif(…, true)`, `addArrival` / `addRequired`): a net's first pin gives its
+        // value; an input PORT's value is the port's own pin, an output port's the instance pin
+        // being written; seconds become picoseconds; the lines follow `.clock` on its own line.
+        let d = D::default()
+            .inst("g", "AND2", 1, &[("A", "e"), ("B", "e2"), ("Z", "o")])
+            .inst("h", "AND2", 2, &[("A", "e"), ("B", "o")])
+            .inst("r", "DFF", 3, &[("D", "d"), ("CK", "clk"), ("Q", "q2")])
+            .port("pe", "INPUT", "e")
+            .port("po", "OUTPUT", "o")
+            .port("pclk", "INPUT", "clk");
+        let arrival = |p: &str| match p {
+            "pe" => [1e-12, 2.5e-12],
+            "r/D" => [1.5e-10, 1.234567e-9],
+            "g/B" => [0.0, 1e-11],
+            _ => panic!("arrival asked of {p}"),
+        };
+        let required = |p: &str| match p {
+            "g/Z" => [2e-10, 3e-10],
+            "r/Q" => [1e-9, 0.0],
+            _ => panic!("required asked of {p}"),
+        };
+        let times = Times { arrival: &arrival, required: &required };
+        let mut c = ConstCells::default();
+        let w = write_blif_timed(&d, &lib(), &names(&["g", "h", "r"]), &mut c, Some(&times)).unwrap();
+        let head = ".model tmp_circuit\n.inputs d e e2\n.outputs o q2\n.clock clk.input_arrival d 150 1234.57\n.input_arrival e 1 2.5\n.input_arrival e2 0 10\n.output_required o 200 300\n.output_required q2 1000 0\n\n\n";
+        assert!(w.text.starts_with(head), "{}", w.text);
+        // The first pin to name a net gives its time (k/A, not k/B); a net driven inside and read
+        // outside is an output, and its input arrival goes with its input; the product is taken
+        // in double precision (3.8449449e-10 s is 384.495 ps, not the single-precision 384.494).
+        let d2 = D::default()
+            .inst("drv", "AND2", 1, &[("Z", "x")])
+            .inst("k", "AND2", 2, &[("A", "x"), ("B", "x"), ("Z", "n")])
+            .inst("b", "AND2", 3, &[("A", "n"), ("Z", "m")])
+            .inst("out", "AND2", 4, &[("A", "n"), ("B", "m")]);
+        let arrival2 = |p: &str| match p {
+            "k/A" => [f32::from_bits(0x2fd3_60ca), 0.0],
+            "k/B" => [9e-9, 9e-9],
+            "b/A" => [7e-9, 7e-9],
+            _ => panic!("arrival asked of {p}"),
+        };
+        let required2 = |_: &str| [0.0, 0.0];
+        let times2 = Times { arrival: &arrival2, required: &required2 };
+        let w = write_blif_timed(&d2, &lib(), &names(&["k", "b"]), &mut c, Some(&times2)).unwrap();
+        assert!(w.text.starts_with(".model tmp_circuit\n.inputs x\n.outputs m n\n.input_arrival x 384.495 0\n.output_required m 0 0\n.output_required n 0 0\n\n\n"), "{}", w.text);
+        // Untimed, the same file has no time lines.
+        let plain = write_blif(&d, &lib(), &names(&["g", "h", "r"]), &mut c).unwrap();
+        assert!(!plain.text.contains("_arrival") && !plain.text.contains("_required"));
+    }
+
+    #[test]
+    fn times_print_as_an_ostream_prints_a_float() {
+        let g = |v: f64| fmt_g(v);
+        assert_eq!(
+            [g(0.0), g(1234.567), g(1e-5), g(0.0001), g(123456.0), g(1234567.0), g(99999.95), g(999999.5), g(-59.867), g(60.619_403_839_111_33)],
+            ["0", "1234.57", "1e-05", "0.0001", "123456", "1.23457e+06", "99999.9", "1e+06", "-59.867", "60.6194"]
+        );
     }
 
     #[test]

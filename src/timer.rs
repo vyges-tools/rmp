@@ -12,10 +12,15 @@ use vyges_sta::search::Search;
 
 use crate::restructure::{Facts, TimerEnv};
 
-/// The design's libraries (Liberty text, in read order) and its constraints.
+/// The design's libraries (Liberty text, in read order), its constraints, and the wire RC an
+/// `estimate_parasitics -placement` ran with (`set_wire_rc`'s arguments; `None`: no estimate, so
+/// no wire parasitics).
 pub struct Timer {
     pub liberties: Vec<String>,
     pub sdc: String,
+    pub wire_rc: Option<Vec<String>>,
+    /// `set_routing_alpha` when the estimate ran.
+    pub alpha: f32,
 }
 
 impl Timer {
@@ -102,13 +107,36 @@ impl TimerEnv for Timer {
         if !propagated {
             g.ideal_clock = vyges_rsz::timing::clock_pins(&g, &clock_sources).into_iter().collect();
         }
-        g.find_delays(&HashMap::new(), None)?;
+        let parasitics = match &self.wire_rc {
+            Some(args) => {
+                let u = liberty.units.ok_or("set_wire_rc before a liberty library: the timer's default units are not modelled")?;
+                let mut rc = vyges_est::rc::Rc::new();
+                rc.check_set_wire_rc(db, args).map_err(|e| e.to_string())?;
+                rc.set_wire_rc(db, vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance }, args).map_err(|e| e.to_string())?;
+                rc.sort_clk_and_signal_layers();
+                let port_caps = g.sdc.port_pin_cap.clone();
+                vyges_rsz::env::placement_parasitics_at(db, &rc, &liberty, &clock_sources, propagated, self.alpha, 1, &port_caps)?.remove(0)
+            }
+            None => HashMap::new(),
+        };
+        g.find_delays(&parasitics, None)?;
         let ssdc = vyges_rsz::env::search_sdc_on(&s, &netlist, time_scale, propagated, false)?;
         let mut search = Search::in_graph_order(&g, &ssdc);
         search.constraints_modelled()?;
         // `check_timing` searches arrivals: an unclocked register pin is one no clock reaches.
         search.find_arrivals()?;
+        // Timing mode's `worstSlack` (requireds), and the BLIF writer's arrivals and requireds.
+        search.find_requireds()?;
         let n = g.vertices.len();
+        // `getArrivalTime` / `getRequiredTime`: an infinite value (no path) is 0.
+        let finite = |x: f32| if x.abs() >= vyges_sta::search::INF_SLACK { 0.0 } else { x };
+        let arrival = |v: usize| -> [f32; 2] {
+            match search.worst_arrival_path(v, vyges_sta::liberty::MAX) {
+                None => [0.0, 0.0],
+                Some(p) => [vyges_sta::liberty::RISE, vyges_sta::liberty::FALL].map(|rf| finite(search.arrival_rf(v, rf, p.tag.mm))),
+            }
+        };
+        let required = |v: usize| -> [f32; 2] { [vyges_sta::liberty::RISE, vyges_sta::liberty::FALL].map(|rf| finite(search.required_rf(v, rf, vyges_sta::liberty::MAX))) };
         let mut f = Facts {
             pin: g.vertices.iter().map(|v| v.name.clone()).collect(),
             inst: (0..n).map(|v| if g.is_port(v) { None } else { g.vertices[v].name.rsplit_once('/').map(|(i, _)| i.to_string()) }).collect(),
@@ -131,6 +159,9 @@ impl TimerEnv for Timer {
             out_edges: g.out_edges.clone(),
             unconstrained: Vec::new(),
             unclocked: (0..n).filter(|&v| search.is_reg_clk(v) && !search.has_clock_arrival(v)).collect(),
+            depth: (0..n).map(|v| search.worst_slack_path(v, vyges_sta::liberty::MAX).map(|p| search.expanded_size(p) / 2)).collect(),
+            arrival: (0..n).map(arrival).collect(),
+            required: (0..n).map(required).collect(),
         };
         // `checkUnconstrainedEndpoints` lists only end points, which are already all ends here.
         f.unconstrained.clear();

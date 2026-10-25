@@ -81,6 +81,13 @@ pub struct Facts {
     pub unconstrained: Vec<usize>,
     /// `check_timing` reg_no_clks: register clock pins no clock reaches.
     pub unclocked: Vec<usize>,
+    /// Timing mode: `PathExpanded(vertexWorstSlackPath(v, max)).size() / 2`; `None` without a
+    /// worst-slack path (unconstrained).
+    pub depth: Vec<Option<usize>>,
+    /// The BLIF writer's `getArrivalTime` / `getRequiredTime` (rise, fall), in seconds: 0 where
+    /// there is no path.
+    pub arrival: Vec<[f32; 2]>,
+    pub required: Vec<[f32; 2]>,
 }
 
 impl Facts {
@@ -180,6 +187,41 @@ pub fn get_end_points(f: &Facts) -> (usize, BTreeSet<String>) {
         ends.insert(f.pin[v].clone());
     }
     (paths, ends)
+}
+
+/// `getEndPoints` in timing mode: the end points in vertex order, each with a worst-slack path
+/// reporting its depth; the FIRST deeper than `max_depth` is the one end (the search stops
+/// there). `(count, ends, depth lines)`.
+pub fn get_end_points_timing(f: &Facts, max_depth: u32) -> (usize, BTreeSet<String>, Vec<String>) {
+    let mut ends = BTreeSet::new();
+    let mut lines = Vec::new();
+    let paths = f.endpoint.iter().filter(|&&e| e).count();
+    for v in (0..f.pin.len()).filter(|&v| f.endpoint[v]) {
+        // Unconstrained end points have no worst-slack path.
+        let Some(depth) = f.depth[v] else { continue };
+        lines.push(format!("Found path of depth {depth}"));
+        if depth > max_depth as usize {
+            ends.insert(f.pin[v].clone());
+            break;
+        }
+    }
+    (paths, ends, lines)
+}
+
+/// `Resizer::findFanins(PinSet)`: back from the end pins' load vertices through combinational
+/// logic; a register output or top-level port stops the search and is left out. The pins
+/// reached, as a set.
+pub fn find_fanins(f: &Facts, ends: &BTreeSet<String>) -> BTreeSet<String> {
+    let seeds: Vec<usize> = ends.iter().filter_map(|p| f.load_vertex(p)).collect::<BTreeSet<_>>().into_iter().collect();
+    let mut fanins = BTreeSet::new();
+    dfs(f, true, &seeds, &mut |v| {
+        if f.reg_output[v] || f.port[v] {
+            return false;
+        }
+        fanins.insert(f.pin[v].clone());
+        true
+    });
+    fanins
 }
 
 /// The resizer's `dfsSearch` with `visit_seeds = false`: from each seed's pred-filtered neighbours,
@@ -349,11 +391,13 @@ pub struct ModeResult {
     pub instances: usize,
 }
 
-/// `runABC`'s choice: area — the FEWEST instances, the first on ties; delay — the last `Delay4`
-/// run that read back. `None` keeps the original netlist.
+/// `runABC`'s choice: area — the FEWEST instances, the first on ties; delay — the `Delay4` run
+/// that read back, kept only when its log gave a delay (below `FLT_MAX`): with none, every run is
+/// discarded. `None` keeps the original netlist.
 pub fn pick_best(results: &[ModeResult], modes: &[Mode], area: bool) -> Option<usize> {
     let mut best = None;
     let mut best_count = usize::MAX;
+    let mut best_delay = f32::MAX;
     for (k, r) in results.iter().enumerate() {
         if !r.ran || !r.log_ok || !r.blif_ok {
             continue;
@@ -364,10 +408,15 @@ pub fn pick_best(results: &[ModeResult], modes: &[Mode], area: bool) -> Option<u
                 best = Some(k);
             }
         } else if modes[k] == Mode::Delay4 {
+            best_delay = r.delay;
             best = Some(k);
         }
     }
-    best
+    if best_count < usize::MAX || best_delay < f32::MAX {
+        best
+    } else {
+        None
+    }
 }
 
 // ---- the database side: the stages in the reference's order ----------------------------------
@@ -408,9 +457,9 @@ pub fn run(db: &mut Db, timer: &dyn TimerEnv, lib: &Library, o: &Options, out: &
     if o.area {
         remove_const_cells(db, timer, lib, o, out)?;
     }
-    let insts = get_blob(db, timer, out)?;
+    let (insts, facts) = get_blob(db, timer, o, out)?;
     if !insts.is_empty() {
-        run_abc(db, lib, o, &insts, out)?;
+        run_abc(db, lib, o, &insts, &facts, out)?;
     }
     Ok(())
 }
@@ -468,15 +517,23 @@ pub fn remove_const_cells(db: &mut Db, timer: &dyn TimerEnv, lib: &Library, o: &
 
 /// `getBlob`: the end points, their fan-in/fan-out logic, its instances (by name; the BLIF
 /// writer takes them in id order).
-pub fn get_blob(db: &Db, timer: &dyn TimerEnv, out: &mut dyn FnMut(&str)) -> Result<Vec<String>, RunError> {
+pub fn get_blob(db: &Db, timer: &dyn TimerEnv, o: &Options, out: &mut dyn FnMut(&str)) -> Result<(Vec<String>, Facts), RunError> {
     let f = timer.facts(db).map_err(RunError::Refused)?;
-    let (paths, ends) = get_end_points(&f);
+    let (paths, ends, lines) = if o.area {
+        let (p, e) = get_end_points(&f);
+        (p, e, Vec::new())
+    } else {
+        get_end_points_timing(&f, o.depth_threshold)
+    };
     out(&format!("Number of paths for restructure are {paths}"));
+    for l in &lines {
+        out(l);
+    }
     out(&format!("Found {} end points for restructure", ends.len()));
     if ends.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), f));
     }
-    let pins = find_fanin_fanouts(&f, &ends);
+    let pins = if o.area { find_fanin_fanouts(&f, &ends) } else { find_fanins(&f, &ends) };
     // A probe's view of this stage: the database it read, its end points and extracted pins.
     if let Some(dir) = std::env::var_os("VYG_RMP_DUMP") {
         let dir = std::path::PathBuf::from(dir);
@@ -491,7 +548,7 @@ pub fn get_blob(db: &Db, timer: &dyn TimerEnv, out: &mut dyn FnMut(&str)) -> Res
     out(&format!("Found {} pins in extracted logic.", pins.len()));
     let insts = blob_instances(&f, &pins, &|i| db.master_is_block(&db.inst_master(i)));
     out(&format!("Found {} instances for restructuring.", insts.len()));
-    Ok(insts.into_iter().collect())
+    Ok((insts.into_iter().collect(), f))
 }
 
 extern "C" {
@@ -511,15 +568,23 @@ fn flush_all() {
 
 /// `runABC`: the cut as BLIF, one ABC session per mode on its own script, each result inspected,
 /// the best read back, the scratch files removed.
-pub fn run_abc(db: &mut Db, lib: &Library, o: &Options, insts: &[String], out: &mut dyn FnMut(&str)) -> Result<(), RunError> {
+pub fn run_abc(db: &mut Db, lib: &Library, o: &Options, insts: &[String], f: &Facts, out: &mut dyn FnMut(&str)) -> Result<(), RunError> {
     let prefix = format!("{}/{}", o.work_dir, db.block_name());
     let input = format!("{prefix}_crit_path.blif");
     let mut remove = vec![input.clone()];
     let (lo, hi) = (o.tie_lo.clone().unwrap_or_default(), o.tie_hi.clone().unwrap_or_default());
     let mut consts = ConstCells { const0_cell: lo.0, const0_port: lo.1, const1_cell: hi.0, const1_port: hi.1 };
-    let written = blif::write_blif(&OdbBlif { db }, lib, insts, &mut consts)?;
+    // Timing mode writes each boundary net's arrival or required time (`write_arrival_requireds`).
+    let at = |pin: &str, of: &Vec<[f32; 2]>| f.load_vertex(pin).map_or([0.0, 0.0], |v| of[v]);
+    let arrival = |pin: &str| at(pin, &f.arrival);
+    let required = |pin: &str| at(pin, &f.required);
+    let times = blif::Times { arrival: &arrival, required: &required };
+    let written = blif::write_blif_timed(&OdbBlif { db }, lib, insts, &mut consts, (!o.area).then_some(&times))?;
     std::fs::write(&input, &written.text).map_err(|e| RunError::Error(format!("[ERROR CUT-0001] Cannot open file {input} for writing: {e}")))?;
     out(&format!("[INFO CUT-0002] Blif writer successfully dumped file with {} instances.", written.instances));
+    if let Some(dir) = std::env::var_os("VYG_RMP_DUMP") {
+        std::fs::write(std::path::Path::new(&dir).join("crit_path.blif"), &written.text).map_err(|e| RunError::Error(format!("VYG_RMP_DUMP: {e}")))?;
+    }
     let modes = modes(o.area);
     let logfile = if o.abc_logfile.is_empty() { format!("{prefix}abc.log") } else { o.abc_logfile.clone() };
     let output = |k: usize| format!("{prefix}{k}_crit_path_out.blif");
@@ -732,6 +797,39 @@ mod tests {
         let mut bad = r(10);
         bad.blif_ok = false;
         assert_eq!(pick_best(&[r(36), bad, r(35)], modes(true), true), Some(2));
-        assert_eq!(pick_best(&[r(1), r(1), r(1), r(9)], modes(false), false), Some(3));
+        // Delay: only the Delay4 run, and only when its log gave a delay — with no log (the
+        // reference's scripts write none) every run is discarded.
+        assert_eq!(pick_best(&[r(1), r(1), r(1), r(9)], modes(false), false), None);
+        let mut timed = r(9);
+        timed.delay = 5.0;
+        assert_eq!(pick_best(&[r(1), r(1), r(1), timed.clone()], modes(false), false), Some(3));
+        assert_eq!(pick_best(&[timed.clone(), r(1), r(1), r(9)], modes(false), false), None);
+    }
+
+    /// Rule (`getEndPoints`, timing): end points in vertex order; one with no worst-slack path is
+    /// skipped silently; each other reports its depth; the first deeper than the threshold is the
+    /// only end, and the search stops there. The count is every end point.
+    #[test]
+    fn the_first_end_deeper_than_the_threshold_is_the_one_end() {
+        let mut f = chain();
+        f.depth = vec![None; f.pin.len()];
+        f.endpoint[1] = true;
+        f.depth[3] = Some(2);
+        f.depth[9] = Some(5);
+        let (paths, ends, lines) = get_end_points_timing(&f, 2);
+        assert_eq!((paths, ends.into_iter().collect::<Vec<_>>(), lines), (3, vec!["out".to_string()], vec!["Found path of depth 2".to_string(), "Found path of depth 5".to_string()]));
+        f.depth[3] = Some(3);
+        let (_, ends, lines) = get_end_points_timing(&f, 2);
+        assert_eq!((ends.into_iter().collect::<Vec<_>>(), lines.len()), (vec!["r/D".to_string()], 1));
+    }
+
+    /// Rule (`findFanins`): back from the ends through combinational logic; register outputs and
+    /// ports stop it and are left out; constants are not crossed; the ends themselves are not in it.
+    #[test]
+    fn fanins_stop_at_register_outputs_and_ports() {
+        let f = chain();
+        let pins = |ends: &[&str]| find_fanins(&f, &ends.iter().map(|e| e.to_string()).collect()).into_iter().collect::<Vec<_>>();
+        assert_eq!(pins(&["out"]), vec!["u2/A", "u2/B", "u2/Z"]);
+        assert_eq!(pins(&["r/D"]), vec!["u1/A", "u1/Z"]);
     }
 }

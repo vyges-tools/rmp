@@ -29,7 +29,9 @@ USAGE:
   vyges physical rmp restructure <design.odb> --liberty FILE... --sdc FILE --liberty-file FILE -o OUT.odb
                          [--target area|timing] [--tielo-port CELL/PORT] [--tiehi-port CELL/PORT]
                          [--work-dir DIR] [--abc-logfile FILE] [--slack-threshold S] [--depth-threshold N]
-                                                  the design's logic re-synthesised through ABC (area)
+                         [--set-wire-rc \"ARGS\"] [--routing-alpha A]
+                                                  the design's logic re-synthesised through ABC
+                                                  (--set-wire-rc: the placement estimate's wire RC)
   vyges physical rmp --describe
   vyges physical rmp --help
   vyges physical rmp --version
@@ -59,8 +61,8 @@ const DESCRIBE: &str = r#"{
   "summary": "Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure -target area` is built; `-target timing` and `run` refuse with exit 3.",
-    "restructure -target area matches the reference at pin 27288f5 on 2 of 2 regression cases: the database (Verilog and DEF) and the log, byte for byte."
+    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure` is built (both targets); `run` refuses with exit 3.",
+    "restructure matches the reference at pin 27288f5 on 3 of 3 regression cases (area and timing targets): the database (Verilog and DEF), the cut BLIF with its arrival and required times, and the log, byte for byte."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -249,6 +251,7 @@ fn restructure(args: &[String]) -> ExitCode {
     let mut o = vyges_rmp::restructure::Options { area: true, slack_threshold: 0.0, depth_threshold: 16, work_dir: ".".into(), ..Default::default() };
     let (mut liberty, mut sdc, mut out, mut pos) = (Vec::new(), None, String::new(), Vec::new());
     let (mut tielo, mut tiehi) = (None, None);
+    let (mut wire_rc, mut alpha): (Option<Vec<String>>, f32) = (None, 0.3);
     let mut it = args.iter();
     while let Some(f) = it.next() {
         let mut value = || it.next().cloned().ok_or_else(|| usage_error(&format!("{f} needs a value")));
@@ -262,6 +265,11 @@ fn restructure(args: &[String]) -> ExitCode {
                     "timing" => o.area = false,
                     t => return Err(usage_error(&format!("--target is area or timing, not `{t}`"))),
                 },
+                "--set-wire-rc" => wire_rc = Some(value()?.split_whitespace().map(String::from).collect()),
+                "--routing-alpha" => {
+                    let v = value()?;
+                    alpha = v.parse().map_err(|_| usage_error(&format!("--routing-alpha needs a number, not `{v}`")))?;
+                }
                 "--tielo-port" => tielo = Some(value()?),
                 "--tiehi-port" => tiehi = Some(value()?),
                 "--work-dir" => o.work_dir = value()?,
@@ -294,9 +302,6 @@ fn restructure(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     let Some(sdc) = sdc else { return usage_error("restructure needs --sdc FILE") };
-    if !o.area {
-        return refused("restructure -target timing is not implemented in this build".into());
-    }
     let lib = match read_libraries(&liberty) {
         Ok(l) => l,
         Err(c) => return c,
@@ -325,7 +330,7 @@ fn restructure(args: &[String]) -> ExitCode {
         Ok(db) => db,
         Err(e) => return input_error(&format!("cannot read {design}: {e}")),
     };
-    let timer = vyges_rmp::timer::Timer { liberties: texts, sdc };
+    let timer = vyges_rmp::timer::Timer { liberties: texts, sdc, wire_rc, alpha };
     let mut say = |l: &str| {
         use std::io::Write;
         println!("{l}");
