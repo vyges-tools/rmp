@@ -90,6 +90,11 @@ pub struct Facts {
     pub required: Vec<[f32; 2]>,
     /// `Sta::slack(vertex, max)`: the least max slack over the scenes (`INF` without a path).
     pub slack: Vec<f32>,
+    /// Per scene (in order), each vertex's `Search::wnsSlack` for the scene's max analysis.
+    pub scene_wns: Vec<Vec<f32>>,
+    /// `Sta::required(vertex, riseFall, every scene, max)`: the fuzzily least required time of the
+    /// vertex's max paths over the scenes (`INF` without a path).
+    pub required_all: Vec<f32>,
 }
 
 impl Facts {

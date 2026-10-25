@@ -47,7 +47,7 @@ extern "C" {
 }
 
 /// Our buffered lines out, then ABC's (C stdio): the log interleaves as the calls ran.
-fn flush() {
+pub(crate) fn flush() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     // SAFETY: `fflush(NULL)` flushes every open output stream; it takes no pointer we own.

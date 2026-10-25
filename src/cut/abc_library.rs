@@ -115,9 +115,16 @@ impl AbcLibrary {
     }
 
     /// `mio_library()`: the gate library, handed over (the network built over it, and then ABC's
-    /// frame, keep it).
-    pub fn take_mio(&mut self) -> Option<GateLib> {
-        self.mio.take()
+    /// frame, keep it); once handed over, each call derives a new one with standard output
+    /// suppressed (its "Derived GENLIB" line is not printed again).
+    pub fn take_mio(&mut self) -> Result<GateLib, String> {
+        match self.mio.take() {
+            Some(m) => Ok(m),
+            None => {
+                let _quiet = vyges_abc_lib::Quiet::new();
+                self.cells.derive_genlib().map_err(|e| e.to_string())
+            }
+        }
     }
 }
 

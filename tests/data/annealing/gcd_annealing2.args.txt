@@ -1,0 +1,1 @@
+resynth_annealing -corner fast -temp 1e-10 -seed 66

@@ -39,6 +39,16 @@ USAGE:
                                                   the logic behind every negative-slack end point
                                                   re-mapped by ABC for delay (the dont-use options
                                                   apply in order after the Liberty dont_use cells)
+  vyges physical rmp resynth-annealing <design.odb> (resynth's options)
+                         [--iters N] [--revert-after N] [--seed S] [--temp T] [--initial-ops N]
+                         [--slack-threshold S]
+                                                  a simulated-annealing search over AIG rewrite
+                                                  sequences for the corner's best worst slack
+  vyges physical rmp resynth-genetic <design.odb> (resynth's options)
+                         [--iters N] [--seed S] [--population-size N] [--mutation-probability P]
+                         [--crossover-probability P] [--tournament-size N]
+                         [--tournament-probability P] [--initial-ops N] [--slack-threshold S]
+                                                  a genetic search over the same sequences
   vyges physical rmp --describe
   vyges physical rmp --help
   vyges physical rmp --version
@@ -60,7 +70,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read", "restructure", "resynth"];
+pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read", "restructure", "resynth", "resynth-annealing", "resynth-genetic"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -68,8 +78,9 @@ const DESCRIBE: &str = r#"{
   "summary": "Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure` is built (both targets); `run` refuses with exit 3.",
-    "restructure matches the reference at pin 27288f5 on 3 of 3 regression cases (area and timing targets): the database (Verilog and DEF), the cut BLIF with its arrival and required times, and the log, byte for byte."
+    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure` (both targets), `resynth`, `resynth-annealing` and `resynth-genetic` are built; `run` refuses with exit 3.",
+    "restructure matches the reference at pin 27288f5 on 3 of 3 regression cases (area and timing targets): the database (Verilog and DEF), the cut BLIF with its arrival and required times, and the log, byte for byte.",
+    "resynth matches the reference at pin 27288f5 on 10 of 10 regression calls, and resynth-annealing and resynth-genetic on 5 of 5: the database (Verilog and DEF) and the log, byte for byte."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -364,9 +375,30 @@ enum DontUseCmd {
     Reset,
 }
 
-/// `resynth`: the Tcl proc's argument handling, then `Restructure::resynth` (the zero-slack
-/// strategy). Log lines are the reference's.
-fn resynth(args: &[String]) -> ExitCode {
+/// The tuning strategies' own options (the Tcl procs' keys), per command.
+const ANNEALING_KEYS: &[&str] = &["--iters", "--revert-after", "--seed", "--temp", "--initial-ops", "--slack-threshold"];
+const GENETIC_KEYS: &[&str] = &[
+    "--iters",
+    "--seed",
+    "--population-size",
+    "--mutation-probability",
+    "--crossover-probability",
+    "--tournament-size",
+    "--tournament-probability",
+    "--initial-ops",
+    "--slack-threshold",
+];
+
+/// `resynth`, `resynth_annealing`, `resynth_genetic`: the Tcl procs' argument handling, then
+/// `Restructure::resynth` (the zero-slack strategy), `resynthAnnealing` or `resynthGenetic`. Log
+/// lines are the reference's.
+fn resynth(args: &[String], command: &str) -> ExitCode {
+    let keys: &[&str] = match command {
+        "resynth-annealing" => ANNEALING_KEYS,
+        "resynth-genetic" => GENETIC_KEYS,
+        _ => &[],
+    };
+    let mut extra: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let (mut liberty, mut sdc, mut out, mut pos) = (Vec::<(Option<String>, String)>::new(), None, String::new(), Vec::new());
     let (mut corners, mut corner, mut name_index): (Vec<String>, Option<String>, i64) = (Vec::new(), None, 0);
     let (mut wire_rc, mut alpha): (Option<Vec<String>>, f32) = (None, 0.3);
@@ -400,6 +432,10 @@ fn resynth(args: &[String]) -> ExitCode {
                 }
                 "-o" => out = value()?,
                 "-q" | "--quiet" | "-v" | "--verbose" => {}
+                x if keys.contains(&x) => {
+                    let v = value()?;
+                    extra.insert(x.to_string(), v);
+                }
                 x if x.starts_with('-') => return Err(usage_error(&format!("unknown option `{x}`"))),
                 x => pos.push(x.to_string()),
             }
@@ -411,7 +447,50 @@ fn resynth(args: &[String]) -> ExitCode {
     }
     let design = match <[String; 1]>::try_from(pos) {
         Ok([d]) if !out.is_empty() => d,
-        _ => return usage_error("resynth needs a design database and -o OUT"),
+        _ => return usage_error(&format!("{command} needs a design database and -o OUT")),
+    };
+    // The strategy's settings, the reference's defaults where an option is not given.
+    fn num<T: std::str::FromStr>(extra: &std::collections::HashMap<String, String>, key: &str, default: T) -> Result<T, ExitCode> {
+        match extra.get(key) {
+            None => Ok(default),
+            Some(v) => v.parse().map_err(|_| usage_error(&format!("{key} needs a number, not `{v}`"))),
+        }
+    }
+    let settings = (|| -> Result<(f32, Option<Box<dyn vyges_rmp::slack_tuning::Strategy>>), ExitCode> {
+        let threshold = num(&extra, "--slack-threshold", 0.0f32)?;
+        // `int seed` given to `mt19937::seed`: taken modulo 2^32.
+        let seed = num(&extra, "--seed", 0i64)? as u32;
+        let strategy: Option<Box<dyn vyges_rmp::slack_tuning::Strategy>> = match command {
+            "resynth-annealing" => Some(Box::new(vyges_rmp::annealing::Annealing {
+                rng: vyges_rmp::rng::Mt19937::new(seed),
+                temperature: match extra.get("--temp") {
+                    None => None,
+                    Some(_) => Some(num(&extra, "--temp", 0.0f32)?),
+                },
+                iterations: num(&extra, "--iters", 100u32)?,
+                revert_after: match extra.get("--revert-after") {
+                    None => None,
+                    Some(_) => Some(num(&extra, "--revert-after", 0u32)?),
+                },
+                initial_ops: num(&extra, "--initial-ops", 10u32)?,
+            })),
+            "resynth-genetic" => Some(Box::new(vyges_rmp::genetic::Genetic {
+                rng: vyges_rmp::rng::Mt19937::new(seed),
+                population_size: num(&extra, "--population-size", 4u32)?,
+                mutation_probability: num(&extra, "--mutation-probability", 0.5f32)?,
+                crossover_probability: num(&extra, "--crossover-probability", 0.5f32)?,
+                tournament_size: num(&extra, "--tournament-size", 4u32)?,
+                tournament_probability: num(&extra, "--tournament-probability", 0.8f32)?,
+                iterations: num(&extra, "--iters", 10u32)?,
+                initial_ops: num(&extra, "--initial-ops", 10u32)?,
+            })),
+            _ => None,
+        };
+        Ok((threshold, strategy))
+    })();
+    let (slack_threshold, mut strategy) = match settings {
+        Ok(s) => s,
+        Err(c) => return c,
     };
     let Some(sdc) = sdc else { return usage_error("resynth needs --sdc FILE") };
     if liberty.is_empty() {
@@ -498,7 +577,13 @@ fn resynth(args: &[String]) -> ExitCode {
         println!("{l}");
         let _ = std::io::stdout().flush();
     };
-    match vyges_rmp::resynth::zero_slack(&mut db, &facts, &l, &mut names, &mut say) {
+    let scene_index = scene.as_ref().and_then(|c| corners.iter().position(|x| x == c)).unwrap_or(0);
+    let time = |d: &vyges_opendb::Db| vyges_rmp::restructure::TimerEnv::facts(&timer, d);
+    let ran = match strategy.as_mut() {
+        None => vyges_rmp::resynth::zero_slack(&mut db, &facts, &l, &mut names, &mut say),
+        Some(s) => vyges_rmp::slack_tuning::optimize_design(&mut db, &facts, &l, &mut names, &time, scene_index, slack_threshold, s.as_mut(), &mut say),
+    };
+    match ran {
         Ok(()) => {}
         Err(vyges_rmp::restructure::RunError::Error(l)) => {
             println!("{l}");
@@ -531,7 +616,7 @@ fn main() -> ExitCode {
         Some("blif-write") => blif_write(&args[1..]),
         Some("blif-read") => blif_read(&args[1..]),
         Some("restructure") => restructure(&args[1..]),
-        Some("resynth") => resynth(&args[1..]),
+        Some(c @ ("resynth" | "resynth-annealing" | "resynth-genetic")) => resynth(&args[1..], c),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-rmp: unknown command `{other}`\n\n{USAGE}");

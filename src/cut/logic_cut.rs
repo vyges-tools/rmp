@@ -43,7 +43,7 @@ fn by_id(names: &BTreeSet<String>, id: &dyn Fn(&str) -> u32) -> Vec<String> {
 /// `BuildMappedAbcNetwork`. Returns the network, the gate library it took, and each cut
 /// instance's node.
 pub fn build_mapped_abc_network(abc: &Abc, cut: &LogicCut, lib: &mut AbcLibrary, view: &View) -> Result<(Network, GateLib), String> {
-    let mio = lib.take_mio().ok_or("resynth: the gate library was already taken")?;
+    let mio = lib.take_mio()?;
     let mut ntk = Network::mapped_netlist(abc, mio).map_err(abc_err)?;
     let d = view.d;
     let input_nets = create_primary_inputs(&mut ntk, &by_id(&cut.primary_inputs, &|n| d.net_id(n)))?;

@@ -1,0 +1,8 @@
+[INFO RMP-0059] Resynthesis: starting tuning algorithm, Worst slack is 3.7464665e-10
+[INFO RMP-0052] Resynthesis: starting simulated annealing
+[INFO RMP-0053] Initial temperature: 9.701867e-10, worst slack: 2.999065e-10
+[INFO RMP-0054] Iteration: 10, temperature: 6.791307e-10, best worst slack: 3.981276e-10
+[INFO RMP-0054] Iteration: 20, temperature: 3.5573514e-10, best worst slack: 3.981276e-10
+[INFO RMP-0054] Iteration: 30, temperature: 3.2339558e-11, best worst slack: 4.1029335e-10
+[INFO RMP-0067] Resynthesis: End of slack tuning, applying ABC operations
+[INFO RMP-0068] Resynthesis: Worst slack is 4.1029335e-10

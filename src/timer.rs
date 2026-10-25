@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 use vyges_opendb::Db;
 use vyges_rsz::preamble::Libs;
 use vyges_sta::liberty::Library;
-use vyges_sta::search::Search;
+use vyges_sta::fuzzy;
+use vyges_sta::search::{Search, INF_SLACK};
 
 use crate::restructure::{Facts, TimerEnv};
 
@@ -168,31 +169,36 @@ impl TimerEnv for Timer {
         search.find_arrivals()?;
         // Timing mode's `worstSlack` (requireds), and the BLIF writer's arrivals and requireds.
         search.find_requireds()?;
-        // `Sta::slack(vertex, max)`: the least slack over every scene's max paths, fuzzily, the
-        // scenes in order.
-        let mut slack: Vec<f32> = (0..g.vertices.len()).map(|v| search.vertex_slack(v)).collect();
-        if libs.scene_count() > 1 {
-            let mut least = vec![vyges_sta::search::INF_SLACK; g.vertices.len()];
-            for (k, par) in parasitics.iter().enumerate() {
-                let per_scene: Vec<f32> = if k == link {
-                    slack.clone()
-                } else {
-                    let mut gk = scene_graph(k)?;
-                    gk.find_delays(par, None)?;
-                    let mut sk = Search::in_graph_order(&gk, &ssdc);
-                    sk.find_arrivals()?;
-                    sk.find_requireds()?;
-                    (0..gk.vertices.len()).map(|v| sk.vertex_slack(v)).collect()
-                };
-                for (l, s) in least.iter_mut().zip(per_scene) {
-                    if vyges_sta::fuzzy::less(s, *l) {
-                        *l = s;
+        // Per scene: `Sta::slack(vertex, max)` (the least over every scene's max paths, fuzzily,
+        // the scenes in order), `wnsSlack`, and `Sta::required` over every scene.
+        let n = g.vertices.len();
+        let (mut slack, mut scene_wns, mut required_all) = (vec![INF_SLACK; n], Vec::new(), vec![INF_SLACK; n]);
+        for (k, par) in parasitics.iter().enumerate() {
+            let take = |sk: &Search, slack: &mut [f32], required_all: &mut [f32]| {
+                for v in 0..n {
+                    let s = sk.vertex_slack(v);
+                    if fuzzy::less(s, slack[v]) {
+                        slack[v] = s;
+                    }
+                    for p in &sk.paths[v] {
+                        if p.tag.mm == vyges_sta::liberty::MAX && fuzzy::less(p.required, required_all[v]) {
+                            required_all[v] = p.required;
+                        }
                     }
                 }
+                (0..n).map(|v| sk.wns_slack(v, true)).collect::<Vec<f32>>()
+            };
+            if k == link {
+                scene_wns.push(take(&search, &mut slack, &mut required_all));
+            } else {
+                let mut gk = scene_graph(k)?;
+                gk.find_delays(par, None)?;
+                let mut sk = Search::in_graph_order(&gk, &ssdc);
+                sk.find_arrivals()?;
+                sk.find_requireds()?;
+                scene_wns.push(take(&sk, &mut slack, &mut required_all));
             }
-            slack = least;
         }
-        let n = g.vertices.len();
         // `getArrivalTime` / `getRequiredTime`: an infinite value (no path) is 0.
         let finite = |x: f32| if x.abs() >= vyges_sta::search::INF_SLACK { 0.0 } else { x };
         let arrival = |v: usize| -> [f32; 2] {
@@ -228,6 +234,8 @@ impl TimerEnv for Timer {
             arrival: (0..n).map(arrival).collect(),
             required: (0..n).map(required).collect(),
             slack,
+            scene_wns,
+            required_all,
         };
         // `checkUnconstrainedEndpoints` lists only end points, which are already all ends here.
         f.unconstrained.clear();
