@@ -30,6 +30,21 @@ vyges physical rmp run <design.odb> <job> -o OUT.odb
 vyges physical rmp --describe
 ```
 
+## Events
+
+Every command leaves a causal trail of [`vyges-events`](https://github.com/vyges-tools/events) JSON
+lines on **stderr**; reports and log lines go to stdout or `-o`, so either can be parsed without the other.
+
+| code | meaning |
+|---|---|
+| `RMP-INPUT` | an input could not be read or an output written (exit 2) |
+| `RMP-REFUSED` | the command, or what it was asked to do, is not implemented in this build (exit 3) |
+| `RMP-STEP` | one step of the command, at `debug` |
+| `RMP-DONE` | every command: its status (`ok`, `finding`, `input`, `refused`) and exit code |
+
+`-q` / `--quiet` raises the trail's floor to `error`; `-v` / `--verbose` lowers it to `debug`.
+An explicit `VYGES_LOG` in the environment wins over both.
+
 ## Install
 
 ```

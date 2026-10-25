@@ -15,6 +15,8 @@
 
 use std::process::ExitCode;
 
+use vyges_rmp::events;
+
 const USAGE: &str = "\
 vyges physical rmp — logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence
 
@@ -56,11 +58,16 @@ USAGE:
 OPTIONS:
   -o FILE               write the report (or the output database) to FILE
   --json                machine-readable output instead of the text report
-  -q, --quiet           suppress non-essential output
-  -v, --verbose         extra detail on stderr
+  -q, --quiet           raise the causal trail's floor to error (VYGES_LOG)
+  -v, --verbose         lower it to debug: each step of the command
   --describe            print a machine-readable JSON description of the command
   --bug-report          file a bug (central: vyges/community)
   --feature-request     request a feature (central)
+
+EVENTS:
+  The causal trail (vyges-events JSON lines) goes to stderr; reports and log lines go to stdout.
+  RMP-INPUT, RMP-REFUSED, RMP-STEP (debug) and RMP-DONE (every command: its status and exit
+  code). An explicit VYGES_LOG wins over -q and -v.
 
 EXIT STATUS:
   0  ok
@@ -85,20 +92,17 @@ const DESCRIBE: &str = r#"{
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
   "artifacts": [],
-  "assertion": { "id": "rmp-ok", "field": "status", "pass_when": { "equals": "ok" } },
+  "assertion": { "id": "rmp-ok", "field": "status", "pass_when": { "eq": "ok" } },
   "consumes": []
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
-    vyges_events::emit(
-        &vyges_events::Event::new("vyges-rmp", vyges_events::Severity::Error, format!("{what} is not implemented in this build"))
-            .with_code("RMP-REFUSED"),
-    );
+    events::refused(&format!("{what} is not implemented in this build"));
     ExitCode::from(3)
 }
 
 fn input_error(msg: &str) -> ExitCode {
-    vyges_events::emit(&vyges_events::Event::new("vyges-rmp", vyges_events::Severity::Error, msg.to_string()).with_code("RMP-INPUT"));
+    events::input(msg);
     ExitCode::from(2)
 }
 
@@ -108,7 +112,7 @@ fn usage_error(msg: &str) -> ExitCode {
 }
 
 fn refused(why: String) -> ExitCode {
-    vyges_events::emit(&vyges_events::Event::new("vyges-rmp", vyges_events::Severity::Error, why).with_code("RMP-REFUSED"));
+    events::refused(&why);
     ExitCode::from(3)
 }
 
@@ -206,6 +210,7 @@ fn blif_write(args: &[String]) -> ExitCode {
     if let Some(i) = a.insts.iter().find(|i| db.inst_master(i).is_empty()) {
         return input_error(&format!("no instance {i}"));
     }
+    events::step("blif-write", &format!("read {} with {} instance(s) to cut", a.design, a.insts.len()));
     let d = vyges_rmp::design::OdbBlif { db: &mut db };
     let w = match vyges_rmp::cut::blif::write_blif(&d, &lib, &a.insts, &mut a.consts) {
         Ok(w) => w,
@@ -240,6 +245,7 @@ fn blif_read(args: &[String]) -> ExitCode {
     if let Some(i) = a.insts.iter().find(|i| db.inst_master(i).is_empty()) {
         return input_error(&format!("no instance {i}"));
     }
+    events::step("blif-read", &format!("read {} and {blif}; replacing {} instance(s)", a.design, a.insts.len()));
     let mut log = Vec::new();
     let r = {
         let mut d = vyges_rmp::design::OdbBlif { db: &mut db };
@@ -354,6 +360,7 @@ fn restructure(args: &[String]) -> ExitCode {
         println!("{l}");
         let _ = std::io::stdout().flush();
     };
+    events::step("restructure", &format!("read {design}; restructuring"));
     match vyges_rmp::restructure::run(&mut db, &timer, &lib, &o, &mut say) {
         Ok(()) => {}
         Err(vyges_rmp::restructure::RunError::Error(l)) => {
@@ -365,6 +372,7 @@ fn restructure(args: &[String]) -> ExitCode {
     if let Err(e) = db.write(&out) {
         return input_error(&format!("cannot write {out}: {e}"));
     }
+    events::step("restructure", &format!("wrote {out}"));
     ExitCode::SUCCESS
 }
 
@@ -579,6 +587,7 @@ fn resynth(args: &[String], command: &str) -> ExitCode {
     };
     let scene_index = scene.as_ref().and_then(|c| corners.iter().position(|x| x == c)).unwrap_or(0);
     let time = |d: &vyges_opendb::Db| vyges_rmp::restructure::TimerEnv::facts(&timer, d);
+    events::step(command, &format!("read {design}; timed it at {} corner(s)", corners.len().max(1)));
     let ran = match strategy.as_mut() {
         None => vyges_rmp::resynth::zero_slack(&mut db, &facts, &l, &mut names, &mut say),
         Some(s) => vyges_rmp::slack_tuning::optimize_design(&mut db, &facts, &l, &mut names, &time, scene_index, slack_threshold, s.as_mut(), &mut say),
@@ -594,11 +603,35 @@ fn resynth(args: &[String], command: &str) -> ExitCode {
     if let Err(e) = db.write(&out) {
         return input_error(&format!("cannot write {out}: {e}"));
     }
+    events::step(command, &format!("wrote {out}"));
     ExitCode::SUCCESS
 }
 
-fn main() -> ExitCode {
+/// The exit code's number, for the trail.
+fn code_of(c: ExitCode) -> u8 {
+    (0..=u8::MAX).find(|&n| ExitCode::from(n) == c).unwrap_or(u8::MAX)
+}
+
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // ⛔ Both flags SET SOMETHING: `vyges-events` reads its floor from `VYGES_LOG` once, so they
+    // land there before the first event. An explicit `VYGES_LOG` in the environment wins.
+    if std::env::var_os("VYGES_LOG").is_none() {
+        if args.iter().any(|a| a == "-q" || a == "--quiet") {
+            std::env::set_var("VYGES_LOG", "error");
+        } else if args.iter().any(|a| a == "-v" || a == "--verbose") {
+            std::env::set_var("VYGES_LOG", "debug");
+        }
+    }
+    let args: Vec<String> = args.into_iter().skip_while(|a| ["-q", "--quiet", "-v", "--verbose"].contains(&a.as_str())).collect();
+    let code = run(&args);
+    if let Some(cmd) = args.first().filter(|c| COMMANDS.contains(&c.as_str())) {
+        events::done(cmd, code_of(code));
+    }
+    code
+}
+
+fn run(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             print!("{USAGE}");
@@ -629,6 +662,14 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    // Rule: the trail's DONE event reports the number the process exits with.
+    #[test]
+    fn the_trail_reports_the_exit_code_given() {
+        for n in [0, 1, 2, 3] {
+            assert_eq!(code_of(ExitCode::from(n)), n);
+        }
+    }
+
     #[test]
     fn the_descriptor_is_valid_json_with_a_legal_maturity() {
         let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
@@ -637,6 +678,8 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
+        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
+        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
     }
 
     #[test]
