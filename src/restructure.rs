@@ -88,6 +88,8 @@ pub struct Facts {
     /// there is no path.
     pub arrival: Vec<[f32; 2]>,
     pub required: Vec<[f32; 2]>,
+    /// `Sta::slack(vertex, max)`: the least max slack over the scenes (`INF` without a path).
+    pub slack: Vec<f32>,
 }
 
 impl Facts {

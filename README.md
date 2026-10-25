@@ -2,7 +2,8 @@
 
 Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.
 
-> **Status: in development.** `restructure` (area and timing targets), `blif-write` and `blif-read` are built;
+> **Status: in development.** `restructure` (area and timing targets), `resynth` (delay re-mapping of the
+> logic behind every failing end point), `blif-write` and `blif-read` are built;
 > `run` refuses with exit 3. Commands are enabled one at a time as
 > each is validated.
 
@@ -15,6 +16,8 @@ Restructuring rebuilds logic for area or delay after placement. Built on one AIG
 ```
 vyges physical rmp restructure <design.odb> --liberty FILE --sdc FILE --liberty-file FILE \
     --tielo-port CELL/PORT --tiehi-port CELL/PORT -o OUT.odb
+vyges physical rmp resynth <design.odb> --liberty [CORNER=]FILE... --sdc FILE \
+    [--corners A,B --corner A] [--dont-use PATTERN...] -o OUT.odb
 vyges physical rmp blif-write <design.odb> --liberty FILE --inst NAME... -o OUT.blif
 vyges physical rmp blif-read  <design.odb> --liberty FILE --inst NAME... --blif FILE -o OUT.odb
 vyges physical rmp run <design.odb> <job> -o OUT.odb

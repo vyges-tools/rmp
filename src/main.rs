@@ -32,6 +32,13 @@ USAGE:
                          [--set-wire-rc \"ARGS\"] [--routing-alpha A]
                                                   the design's logic re-synthesised through ABC
                                                   (--set-wire-rc: the placement estimate's wire RC)
+  vyges physical rmp resynth <design.odb> --liberty [CORNER=]FILE... --sdc FILE -o OUT.odb
+                         [--corners A,B,...] [--corner C] [--name-index N]
+                         [--dont-use PAT] [--unset-dont-use PAT] [--reset-dont-use]
+                         [--set-wire-rc \"ARGS\"] [--routing-alpha A]
+                                                  the logic behind every negative-slack end point
+                                                  re-mapped by ABC for delay (the dont-use options
+                                                  apply in order after the Liberty dont_use cells)
   vyges physical rmp --describe
   vyges physical rmp --help
   vyges physical rmp --version
@@ -53,7 +60,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read", "restructure"];
+pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read", "restructure", "resynth"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -330,13 +337,168 @@ fn restructure(args: &[String]) -> ExitCode {
         Ok(db) => db,
         Err(e) => return input_error(&format!("cannot read {design}: {e}")),
     };
-    let timer = vyges_rmp::timer::Timer { liberties: texts, sdc, wire_rc, alpha };
+    let timer = vyges_rmp::timer::Timer { liberties: texts, corners: Vec::new(), liberty_corners: Vec::new(), sdc, wire_rc, alpha };
     let mut say = |l: &str| {
         use std::io::Write;
         println!("{l}");
         let _ = std::io::stdout().flush();
     };
     match vyges_rmp::restructure::run(&mut db, &timer, &lib, &o, &mut say) {
+        Ok(()) => {}
+        Err(vyges_rmp::restructure::RunError::Error(l)) => {
+            println!("{l}");
+            return ExitCode::from(1);
+        }
+        Err(vyges_rmp::restructure::RunError::Refused(why)) => return refused(why),
+    }
+    if let Err(e) = db.write(&out) {
+        return input_error(&format!("cannot write {out}: {e}"));
+    }
+    ExitCode::SUCCESS
+}
+
+/// One `set_dont_use` / `unset_dont_use` / `reset_dont_use`, in script order.
+enum DontUseCmd {
+    Set(String),
+    Unset(String),
+    Reset,
+}
+
+/// `resynth`: the Tcl proc's argument handling, then `Restructure::resynth` (the zero-slack
+/// strategy). Log lines are the reference's.
+fn resynth(args: &[String]) -> ExitCode {
+    let (mut liberty, mut sdc, mut out, mut pos) = (Vec::<(Option<String>, String)>::new(), None, String::new(), Vec::new());
+    let (mut corners, mut corner, mut name_index): (Vec<String>, Option<String>, i64) = (Vec::new(), None, 0);
+    let (mut wire_rc, mut alpha): (Option<Vec<String>>, f32) = (None, 0.3);
+    let mut dont_use_cmds = Vec::new();
+    let mut it = args.iter();
+    while let Some(f) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| usage_error(&format!("{f} needs a value")));
+        let r: Result<(), ExitCode> = (|| {
+            match f.as_str() {
+                "--liberty" => {
+                    let v = value()?;
+                    match v.split_once('=') {
+                        Some((c, p)) => liberty.push((Some(c.to_string()), p.to_string())),
+                        None => liberty.push((None, v)),
+                    }
+                }
+                "--sdc" => sdc = Some(value()?),
+                "--corners" => corners = value()?.split(',').map(String::from).collect(),
+                "--corner" => corner = Some(value()?),
+                "--name-index" => {
+                    let v = value()?;
+                    name_index = v.parse().map_err(|_| usage_error(&format!("--name-index needs a number, not `{v}`")))?;
+                }
+                "--dont-use" => dont_use_cmds.push(DontUseCmd::Set(value()?)),
+                "--unset-dont-use" => dont_use_cmds.push(DontUseCmd::Unset(value()?)),
+                "--reset-dont-use" => dont_use_cmds.push(DontUseCmd::Reset),
+                "--set-wire-rc" => wire_rc = Some(value()?.split_whitespace().map(String::from).collect()),
+                "--routing-alpha" => {
+                    let v = value()?;
+                    alpha = v.parse().map_err(|_| usage_error(&format!("--routing-alpha needs a number, not `{v}`")))?;
+                }
+                "-o" => out = value()?,
+                "-q" | "--quiet" | "-v" | "--verbose" => {}
+                x if x.starts_with('-') => return Err(usage_error(&format!("unknown option `{x}`"))),
+                x => pos.push(x.to_string()),
+            }
+            Ok(())
+        })();
+        if let Err(c) = r {
+            return c;
+        }
+    }
+    let design = match <[String; 1]>::try_from(pos) {
+        Ok([d]) if !out.is_empty() => d,
+        _ => return usage_error("resynth needs a design database and -o OUT"),
+    };
+    let Some(sdc) = sdc else { return usage_error("resynth needs --sdc FILE") };
+    if liberty.is_empty() {
+        return usage_error("resynth needs --liberty FILE");
+    }
+    let mut texts = Vec::new();
+    let mut libs = Vec::new();
+    for (_, f) in &liberty {
+        let text = match vyges_rsz::job::read_text(f) {
+            Ok(t) => t,
+            Err(e) => return input_error(&e),
+        };
+        match vyges_sta::liberty_parse::parse(&text).and_then(|g| vyges_sta::liberty::Library::read(&g)) {
+            Ok(l) => libs.push(l),
+            Err(e) => return input_error(&format!("cannot read {f}: {e}")),
+        }
+        texts.push(text);
+    }
+    // `sta::parse_scene`: the named corner, else the command scene (the first).
+    let scene = match &corner {
+        Some(c) if !corners.contains(c) => return usage_error(&format!("--corner {c}: not among --corners")),
+        Some(c) => Some(c.clone()),
+        None => corners.first().cloned(),
+    };
+    // `dont_use_`: the Liberty dont_use cells (`copyDontUseFromLiberty`), then each command in order
+    // over every library's cells matching it (`reset_dont_use` clears and copies again).
+    let liberty_dont_use = |set: &mut std::collections::BTreeSet<(usize, String)>| {
+        for (k, l) in libs.iter().enumerate() {
+            set.extend(l.cells.values().filter(|c| c.dont_use).map(|c| (k, c.name.clone())));
+        }
+    };
+    let mut dont_use = std::collections::BTreeSet::new();
+    liberty_dont_use(&mut dont_use);
+    for c in &dont_use_cmds {
+        match c {
+            DontUseCmd::Reset => {
+                dont_use.clear();
+                liberty_dont_use(&mut dont_use);
+            }
+            DontUseCmd::Set(p) | DontUseCmd::Unset(p) => {
+                for (k, l) in libs.iter().enumerate() {
+                    for name in l.cells.keys().filter(|n| p.split_whitespace().any(|q| vyges_rsz::job::glob_match(q, n))) {
+                        if matches!(c, DontUseCmd::Set(_)) {
+                            dont_use.insert((k, name.clone()));
+                        } else {
+                            dont_use.remove(&(k, name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let sdc = match std::fs::read_to_string(&sdc) {
+        Ok(t) => t,
+        Err(e) => return input_error(&format!("cannot read {sdc}: {e}")),
+    };
+    let mut db = match vyges_opendb::Db::open(&design) {
+        Ok(db) => db,
+        Err(e) => return input_error(&format!("cannot read {design}: {e}")),
+    };
+    let timer = vyges_rmp::timer::Timer {
+        liberties: texts,
+        corners: corners.clone(),
+        liberty_corners: liberty.iter().map(|(c, _)| c.clone()).collect(),
+        sdc,
+        wire_rc,
+        alpha,
+    };
+    let facts = match vyges_rmp::restructure::TimerEnv::facts(&timer, &db) {
+        Ok(f) => f,
+        Err(e) => return refused(format!("resynth: timer: {e}")),
+    };
+    let corner_libs: Vec<vyges_rmp::cut::abc_library::CornerLib> = libs
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| liberty[*k].0.is_none() || liberty[*k].0 == scene)
+        .map(|(index, lib)| vyges_rmp::cut::abc_library::CornerLib { index, lib })
+        .collect();
+    let is_dont_use = |k: usize, name: &str| dont_use.contains(&(k, name.to_string()));
+    let l = vyges_rmp::resynth::Libraries { default: &libs[0], default_path: &liberty[0].1, corner: corner_libs, dont_use: &is_dont_use };
+    let mut names = vyges_rmp::cut::logic_cut::UniqueName { counter: name_index };
+    let mut say = |l: &str| {
+        use std::io::Write;
+        println!("{l}");
+        let _ = std::io::stdout().flush();
+    };
+    match vyges_rmp::resynth::zero_slack(&mut db, &facts, &l, &mut names, &mut say) {
         Ok(()) => {}
         Err(vyges_rmp::restructure::RunError::Error(l)) => {
             println!("{l}");
@@ -369,6 +531,7 @@ fn main() -> ExitCode {
         Some("blif-write") => blif_write(&args[1..]),
         Some("blif-read") => blif_read(&args[1..]),
         Some("restructure") => restructure(&args[1..]),
+        Some("resynth") => resynth(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-rmp: unknown command `{other}`\n\n{USAGE}");

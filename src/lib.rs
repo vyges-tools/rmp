@@ -6,4 +6,5 @@
 pub mod cut;
 pub mod design;
 pub mod restructure;
+pub mod resynth;
 pub mod timer;

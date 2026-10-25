@@ -17,6 +17,11 @@ use crate::restructure::{Facts, TimerEnv};
 /// no wire parasitics).
 pub struct Timer {
     pub liberties: Vec<String>,
+    /// `define_corners`, in order; empty is the one scene `default`.
+    pub corners: Vec<String>,
+    /// Per library (parallel to `liberties`): the corner `read_liberty -corner` named, `None` for
+    /// every corner.
+    pub liberty_corners: Vec<Option<String>>,
     pub sdc: String,
     pub wire_rc: Option<Vec<String>>,
     /// `set_routing_alpha` when the estimate ran.
@@ -24,6 +29,43 @@ pub struct Timer {
 }
 
 impl Timer {
+    /// The libraries as the scenes read them: a `-corner` library serves its corner, any other
+    /// every corner; the first library read is the link library, its corner the link scene.
+    pub fn libs(&self) -> Result<Libs, String> {
+        let mut libs = Libs { scenes: if self.corners.is_empty() { vec!["default".into()] } else { self.corners.clone() }, ..Libs::default() };
+        if !self.corners.is_empty() {
+            libs.scene_libs = vec![Vec::new(); self.corners.len()];
+        }
+        for (k, text) in self.liberties.iter().enumerate() {
+            let group = vyges_sta::liberty_parse::parse(text)?;
+            if group.simple.iter().any(|(n, _)| n.starts_with("k_")) || group.groups_of("scaling_factors").next().is_some() {
+                return Err("liberty k_ scale factors are not modelled".into());
+            }
+            let lib = Library::read(&group)?;
+            let corner = self.liberty_corners.get(k).cloned().flatten();
+            let scene = match &corner {
+                Some(c) => Some(self.corners.iter().position(|s| s == c).ok_or_else(|| format!("read_liberty -corner {c}: corner not defined"))?),
+                None => None,
+            };
+            if self.corners.is_empty() {
+                if scene.is_some() {
+                    return Err("read_liberty -corner without define_corners".into());
+                }
+            } else {
+                if libs.libs.is_empty() {
+                    libs.link_scene = scene;
+                }
+                for (j, sl) in libs.scene_libs.iter_mut().enumerate() {
+                    if scene.is_none_or(|c| c == j) {
+                        sl.push(lib.clone());
+                    }
+                }
+            }
+            libs.libs.push(lib);
+        }
+        Ok(libs)
+    }
+
     fn clocks(&self) -> Result<vyges_est::liberty::LibertyClocks, String> {
         let mut liberty = vyges_est::liberty::LibertyClocks::default();
         for text in &self.liberties {
@@ -47,14 +89,7 @@ impl TimerEnv for Timer {
 
     fn facts(&self, db: &Db) -> Result<Facts, String> {
         let liberty = self.clocks()?;
-        let mut libs = Libs { scenes: vec!["default".into()], ..Libs::default() };
-        for text in &self.liberties {
-            let group = vyges_sta::liberty_parse::parse(text)?;
-            if group.simple.iter().any(|(n, _)| n.starts_with("k_")) || group.groups_of("scaling_factors").next().is_some() {
-                return Err("liberty k_ scale factors are not modelled".into());
-            }
-            libs.libs.push(Library::read(&group)?);
-        }
+        let libs = self.libs()?;
         let time_scale = libs.default_library().ok_or("restructure needs a liberty library")?.time_scale;
         let mut s = vyges_loom::sdc::Sdc::parse(&self.sdc).map_err(|e| format!("constraints: {e:?}"))?;
         let netlist = vyges_grt::timer::netlist(db);
@@ -102,11 +137,17 @@ impl TimerEnv for Timer {
         let values = vyges_est::sim::constant_pins_constrained(db, &liberty, &constraints).map_err(|e| format!("constant propagation: {e}"))?;
         env.constants = vyges_rsz::env::constants_by_name(values);
         let propagated = !s.propagated.is_empty();
-        let mut g = vyges_sta::graph::Graph::build_with_pins(libs.scene_slice(0), &netlist, Some(&mpins))?;
-        g.sdc = env;
-        if !propagated {
-            g.ideal_clock = vyges_rsz::timing::clock_pins(&g, &clock_sources).into_iter().collect();
-        }
+        // The link scene's graph is the design's; every scene's slack is asked of its own.
+        let link = libs.link_scene.unwrap_or(0);
+        let scene_graph = |k: usize| -> Result<vyges_sta::graph::Graph, String> {
+            let mut g = vyges_sta::graph::Graph::build_with_pins(libs.scene_slice(k), &netlist, Some(&mpins))?;
+            g.sdc = env.clone();
+            if !propagated {
+                g.ideal_clock = vyges_rsz::timing::clock_pins(&g, &clock_sources).into_iter().collect();
+            }
+            Ok(g)
+        };
+        let mut g = scene_graph(link)?;
         let parasitics = match &self.wire_rc {
             Some(args) => {
                 let u = liberty.units.ok_or("set_wire_rc before a liberty library: the timer's default units are not modelled")?;
@@ -115,11 +156,11 @@ impl TimerEnv for Timer {
                 rc.set_wire_rc(db, vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance }, args).map_err(|e| e.to_string())?;
                 rc.sort_clk_and_signal_layers();
                 let port_caps = g.sdc.port_pin_cap.clone();
-                vyges_rsz::env::placement_parasitics_at(db, &rc, &liberty, &clock_sources, propagated, self.alpha, 1, &port_caps)?.remove(0)
+                vyges_rsz::env::placement_parasitics_at(db, &rc, &liberty, &clock_sources, propagated, self.alpha, libs.scene_count(), &port_caps)?
             }
-            None => HashMap::new(),
+            None => vec![HashMap::new(); libs.scene_count()],
         };
-        g.find_delays(&parasitics, None)?;
+        g.find_delays(&parasitics[link], None)?;
         let ssdc = vyges_rsz::env::search_sdc_on(&s, &netlist, time_scale, propagated, false)?;
         let mut search = Search::in_graph_order(&g, &ssdc);
         search.constraints_modelled()?;
@@ -127,6 +168,30 @@ impl TimerEnv for Timer {
         search.find_arrivals()?;
         // Timing mode's `worstSlack` (requireds), and the BLIF writer's arrivals and requireds.
         search.find_requireds()?;
+        // `Sta::slack(vertex, max)`: the least slack over every scene's max paths, fuzzily, the
+        // scenes in order.
+        let mut slack: Vec<f32> = (0..g.vertices.len()).map(|v| search.vertex_slack(v)).collect();
+        if libs.scene_count() > 1 {
+            let mut least = vec![vyges_sta::search::INF_SLACK; g.vertices.len()];
+            for (k, par) in parasitics.iter().enumerate() {
+                let per_scene: Vec<f32> = if k == link {
+                    slack.clone()
+                } else {
+                    let mut gk = scene_graph(k)?;
+                    gk.find_delays(par, None)?;
+                    let mut sk = Search::in_graph_order(&gk, &ssdc);
+                    sk.find_arrivals()?;
+                    sk.find_requireds()?;
+                    (0..gk.vertices.len()).map(|v| sk.vertex_slack(v)).collect()
+                };
+                for (l, s) in least.iter_mut().zip(per_scene) {
+                    if vyges_sta::fuzzy::less(s, *l) {
+                        *l = s;
+                    }
+                }
+            }
+            slack = least;
+        }
         let n = g.vertices.len();
         // `getArrivalTime` / `getRequiredTime`: an infinite value (no path) is 0.
         let finite = |x: f32| if x.abs() >= vyges_sta::search::INF_SLACK { 0.0 } else { x };
@@ -162,6 +227,7 @@ impl TimerEnv for Timer {
             depth: (0..n).map(|v| search.worst_slack_path(v, vyges_sta::liberty::MAX).map(|p| search.expanded_size(p) / 2)).collect(),
             arrival: (0..n).map(arrival).collect(),
             required: (0..n).map(required).collect(),
+            slack,
         };
         // `checkUnconstrainedEndpoints` lists only end points, which are already all ends here.
         f.unconstrained.clear();

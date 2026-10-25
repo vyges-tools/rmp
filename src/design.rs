@@ -76,3 +76,35 @@ impl BlifDesign for OdbBlif<'_> {
         self.db.connect(inst, mterm, net).map_err(|e| e.to_string())
     }
 }
+
+/// What a re-synthesis asks of the design beyond the BLIF reader's questions.
+pub trait CutDesign: BlifDesign {
+    /// `dbNet::getId`.
+    fn net_id(&self, net: &str) -> u32;
+    /// The net a top-level port is on.
+    fn bterm_net(&self, bterm: &str) -> Option<String>;
+    /// `dbInst::isDoNotTouch` / `dbNet::isDoNotTouch`.
+    fn inst_dont_touch(&self, inst: &str) -> bool;
+    fn net_dont_touch(&self, net: &str) -> bool;
+    /// `dbBlock::makeNewNetName(top, base, ALWAYS)`: `base` with the block's next free unique net
+    /// index appended (the index is the database's own and advances).
+    fn new_net_name(&mut self, base: &str) -> Result<String, String>;
+}
+
+impl CutDesign for OdbBlif<'_> {
+    fn net_id(&self, net: &str) -> u32 {
+        self.db.net_id(net).unwrap_or(u32::MAX)
+    }
+    fn bterm_net(&self, bterm: &str) -> Option<String> {
+        some(self.db.bterm_get_net(bterm))
+    }
+    fn inst_dont_touch(&self, inst: &str) -> bool {
+        self.db.inst_is_do_not_touch(inst)
+    }
+    fn net_dont_touch(&self, net: &str) -> bool {
+        self.db.net_is_do_not_touch(net)
+    }
+    fn new_net_name(&mut self, base: &str) -> Result<String, String> {
+        self.db.make_new_net_name(base, "ALWAYS").map_err(|e| e.to_string())
+    }
+}
