@@ -26,6 +26,10 @@ USAGE:
   vyges physical rmp blif-read  <design.odb> --liberty FILE... --inst NAME... --blif FILE -o OUT.odb
                          [--const0 CELL PORT] [--const1 CELL PORT] [--call-id N]
                                                   replace the instances by the BLIF's gates
+  vyges physical rmp restructure <design.odb> --liberty FILE... --sdc FILE --liberty-file FILE -o OUT.odb
+                         [--target area|timing] [--tielo-port CELL/PORT] [--tiehi-port CELL/PORT]
+                         [--work-dir DIR] [--abc-logfile FILE] [--slack-threshold S] [--depth-threshold N]
+                                                  the design's logic re-synthesised through ABC (area)
   vyges physical rmp --describe
   vyges physical rmp --help
   vyges physical rmp --version
@@ -47,7 +51,7 @@ EXIT STATUS:
 ";
 
 /// The commands this engine will answer. Each is refused (exit 3) until its stage is built.
-pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read"];
+pub const COMMANDS: &[&str] = &["run", "blif-write", "blif-read", "restructure"];
 
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
@@ -55,7 +59,8 @@ const DESCRIBE: &str = r#"{
   "summary": "Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.",
   "maturity": "discovered",
   "provenance_limitations": [
-    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `run` refuses with exit 3."
+    "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure -target area` is built; `-target timing` and `run` refuse with exit 3.",
+    "restructure -target area matches the reference at pin 27288f5 on 2 of 2 regression cases: the database (Verilog and DEF) and the log, byte for byte."
   ],
   "invocation": { "args_template": ["run"], "emits_json": true },
   "inputs": { "type": "object", "properties": {} },
@@ -232,6 +237,114 @@ fn blif_read(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A `-tielo_port` / `-tiehi_port` as `get_lib_pins` resolves it: the cell and port must exist in
+/// a library, else the port is not set (no tie cell, so no constant removal).
+fn lib_port(lib: &vyges_sta::liberty::Library, spec: &str) -> Option<(String, String)> {
+    let (cell, port) = spec.rsplit_once('/')?;
+    lib.cells.get(cell)?.ports.iter().any(|p| p.name == port).then(|| (cell.to_string(), port.to_string()))
+}
+
+/// `restructure`: the Tcl proc's argument handling, then `Restructure::run`. Log lines are the reference's.
+fn restructure(args: &[String]) -> ExitCode {
+    let mut o = vyges_rmp::restructure::Options { area: true, slack_threshold: 0.0, depth_threshold: 16, work_dir: ".".into(), ..Default::default() };
+    let (mut liberty, mut sdc, mut out, mut pos) = (Vec::new(), None, String::new(), Vec::new());
+    let (mut tielo, mut tiehi) = (None, None);
+    let mut it = args.iter();
+    while let Some(f) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| usage_error(&format!("{f} needs a value")));
+        let r: Result<(), ExitCode> = (|| {
+            match f.as_str() {
+                "--liberty" => liberty.push(value()?),
+                "--sdc" => sdc = Some(value()?),
+                "--liberty-file" => o.liberty_file = value()?,
+                "--target" => match value()?.as_str() {
+                    "area" => o.area = true,
+                    "timing" => o.area = false,
+                    t => return Err(usage_error(&format!("--target is area or timing, not `{t}`"))),
+                },
+                "--tielo-port" => tielo = Some(value()?),
+                "--tiehi-port" => tiehi = Some(value()?),
+                "--work-dir" => o.work_dir = value()?,
+                "--abc-logfile" => o.abc_logfile = value()?,
+                "--slack-threshold" => {
+                    let v = value()?;
+                    o.slack_threshold = v.parse().map_err(|_| usage_error(&format!("--slack-threshold needs a number, not `{v}`")))?;
+                }
+                "--depth-threshold" => {
+                    let v = value()?;
+                    o.depth_threshold = v.parse().map_err(|_| usage_error(&format!("--depth-threshold needs a number, not `{v}`")))?;
+                }
+                "-o" => out = value()?,
+                "-q" | "--quiet" | "-v" | "--verbose" => {}
+                x if x.starts_with('-') => return Err(usage_error(&format!("unknown option `{x}`"))),
+                x => pos.push(x.to_string()),
+            }
+            Ok(())
+        })();
+        if let Err(c) = r {
+            return c;
+        }
+    }
+    let design = match <[String; 1]>::try_from(pos) {
+        Ok([d]) if !out.is_empty() => d,
+        _ => return usage_error("restructure needs a design database and -o OUT"),
+    };
+    if o.liberty_file.is_empty() {
+        println!("[ERROR RMP-0001] Missing argument -liberty_file");
+        return ExitCode::from(1);
+    }
+    let Some(sdc) = sdc else { return usage_error("restructure needs --sdc FILE") };
+    if !o.area {
+        return refused("restructure -target timing is not implemented in this build".into());
+    }
+    let lib = match read_libraries(&liberty) {
+        Ok(l) => l,
+        Err(c) => return c,
+    };
+    // The proc warns for a port not given, and quietly skips one `get_lib_pins` does not find.
+    match &tielo {
+        Some(p) => o.tie_lo = lib_port(&lib, p),
+        None => println!("[WARNING RMP-0007] -tielo_port not specified"),
+    }
+    match &tiehi {
+        Some(p) => o.tie_hi = lib_port(&lib, p),
+        None => println!("[WARNING RMP-0008] -tiehi_port not specified"),
+    }
+    let mut texts = Vec::new();
+    for f in &liberty {
+        match std::fs::read_to_string(f) {
+            Ok(t) => texts.push(t),
+            Err(e) => return input_error(&format!("cannot read {f}: {e}")),
+        }
+    }
+    let sdc = match std::fs::read_to_string(&sdc) {
+        Ok(t) => t,
+        Err(e) => return input_error(&format!("cannot read {sdc}: {e}")),
+    };
+    let mut db = match vyges_opendb::Db::open(&design) {
+        Ok(db) => db,
+        Err(e) => return input_error(&format!("cannot read {design}: {e}")),
+    };
+    let timer = vyges_rmp::timer::Timer { liberties: texts, sdc };
+    let mut say = |l: &str| {
+        use std::io::Write;
+        println!("{l}");
+        let _ = std::io::stdout().flush();
+    };
+    match vyges_rmp::restructure::run(&mut db, &timer, &lib, &o, &mut say) {
+        Ok(()) => {}
+        Err(vyges_rmp::restructure::RunError::Error(l)) => {
+            println!("{l}");
+            return ExitCode::from(1);
+        }
+        Err(vyges_rmp::restructure::RunError::Refused(why)) => return refused(why),
+    }
+    if let Err(e) = db.write(&out) {
+        return input_error(&format!("cannot write {out}: {e}"));
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -250,6 +363,7 @@ fn main() -> ExitCode {
         }
         Some("blif-write") => blif_write(&args[1..]),
         Some("blif-read") => blif_read(&args[1..]),
+        Some("restructure") => restructure(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => refuse(cmd),
         Some(other) => {
             eprintln!("vyges-rmp: unknown command `{other}`\n\n{USAGE}");

@@ -1,0 +1,139 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The timer `restructure` asks, built over the database as the other engines build it: the
+//! netlist from the database, the libraries, the constraints, the logic constants, one graph,
+//! its delays and arrivals.
+
+use std::collections::{BTreeMap, HashMap};
+
+use vyges_opendb::Db;
+use vyges_rsz::preamble::Libs;
+use vyges_sta::liberty::Library;
+use vyges_sta::search::Search;
+
+use crate::restructure::{Facts, TimerEnv};
+
+/// The design's libraries (Liberty text, in read order) and its constraints.
+pub struct Timer {
+    pub liberties: Vec<String>,
+    pub sdc: String,
+}
+
+impl Timer {
+    fn clocks(&self) -> Result<vyges_est::liberty::LibertyClocks, String> {
+        let mut liberty = vyges_est::liberty::LibertyClocks::default();
+        for text in &self.liberties {
+            liberty.read(text)?;
+        }
+        Ok(liberty)
+    }
+}
+
+impl TimerEnv for Timer {
+    fn logic_constants(&self, db: &Db) -> Result<BTreeMap<(String, String), bool>, String> {
+        let pins = vyges_est::sim::logic_constants(db, &self.clocks()?).map_err(|e| e.to_string())?;
+        Ok(pins
+            .into_iter()
+            .filter_map(|(p, v)| match p {
+                vyges_est::sim::Pin::ITerm(i, t) => Some(((i, t), v)),
+                vyges_est::sim::Pin::Port(_) => None,
+            })
+            .collect())
+    }
+
+    fn facts(&self, db: &Db) -> Result<Facts, String> {
+        let liberty = self.clocks()?;
+        let mut libs = Libs { scenes: vec!["default".into()], ..Libs::default() };
+        for text in &self.liberties {
+            let group = vyges_sta::liberty_parse::parse(text)?;
+            if group.simple.iter().any(|(n, _)| n.starts_with("k_")) || group.groups_of("scaling_factors").next().is_some() {
+                return Err("liberty k_ scale factors are not modelled".into());
+            }
+            libs.libs.push(Library::read(&group)?);
+        }
+        let time_scale = libs.default_library().ok_or("restructure needs a liberty library")?.time_scale;
+        let mut s = vyges_loom::sdc::Sdc::parse(&self.sdc).map_err(|e| format!("constraints: {e:?}"))?;
+        let netlist = vyges_grt::timer::netlist(db);
+        let mpins = vyges_rsz::env::master_pins(db)?;
+        for (name, cell) in netlist.insts.iter().map(|i| &**i) {
+            if !libs.libs.iter().any(|l| l.cells.contains_key(cell.as_str())) {
+                return Err(format!("{name}: master {cell} has no Liberty cell"));
+            }
+        }
+        // A constraint names a pin by its path name, the database by its escaped name.
+        let mut by_path: HashMap<String, String> = netlist.ports.iter().map(|(p, _)| (vyges_sta::power::path_name(p), p.clone())).collect();
+        for (name, cell) in netlist.insts.iter().map(|i| &**i) {
+            for p in mpins.get(cell).cloned().unwrap_or_default() {
+                let pin = format!("{name}/{p}");
+                by_path.insert(vyges_sta::power::path_name(&pin), pin);
+            }
+        }
+        for c in &mut s.clocks {
+            for src in &mut c.sources {
+                if let Some(name) = by_path.get(src.as_str()) {
+                    *src = name.clone();
+                }
+            }
+        }
+        let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+        let mut env = vyges_rsz::env::sdc_env(&s, &libs, &netlist)?;
+        // `ensureConstantsPropagated` seeds `set_logic_*` and `set_case_analysis` too.
+        let mut constraints = vyges_est::sim::Constraints::default();
+        for (cmds, map) in [(&s.logic_values, &mut constraints.logic), (&s.case_values, &mut constraints.case)] {
+            for c in cmds {
+                for o in &c.objects {
+                    let pin = match c.accessor.as_str() {
+                        "get_ports" => vyges_est::sim::Pin::Port(by_path.get(o).cloned().unwrap_or_else(|| o.clone())),
+                        "get_pins" => {
+                            let name = by_path.get(o).cloned().unwrap_or_else(|| o.clone());
+                            let (i, t) = name.rsplit_once('/').ok_or_else(|| format!("{}: `{o}` is not an instance pin", c.cmd))?;
+                            vyges_est::sim::Pin::ITerm(i.to_string(), t.to_string())
+                        }
+                        a => return Err(format!("{} on `{a}` objects is not modelled", c.cmd)),
+                    };
+                    map.insert(pin, c.constant());
+                }
+            }
+        }
+        let values = vyges_est::sim::constant_pins_constrained(db, &liberty, &constraints).map_err(|e| format!("constant propagation: {e}"))?;
+        env.constants = vyges_rsz::env::constants_by_name(values);
+        let propagated = !s.propagated.is_empty();
+        let mut g = vyges_sta::graph::Graph::build_with_pins(libs.scene_slice(0), &netlist, Some(&mpins))?;
+        g.sdc = env;
+        if !propagated {
+            g.ideal_clock = vyges_rsz::timing::clock_pins(&g, &clock_sources).into_iter().collect();
+        }
+        g.find_delays(&HashMap::new(), None)?;
+        let ssdc = vyges_rsz::env::search_sdc_on(&s, &netlist, time_scale, propagated, false)?;
+        let mut search = Search::in_graph_order(&g, &ssdc);
+        search.constraints_modelled()?;
+        // `check_timing` searches arrivals: an unclocked register pin is one no clock reaches.
+        search.find_arrivals()?;
+        let n = g.vertices.len();
+        let mut f = Facts {
+            pin: g.vertices.iter().map(|v| v.name.clone()).collect(),
+            inst: (0..n).map(|v| if g.is_port(v) { None } else { g.vertices[v].name.rsplit_once('/').map(|(i, _)| i.to_string()) }).collect(),
+            endpoint: (0..n).map(|v| search.is_endpoint(v)).collect(),
+            port: (0..n).map(|v| g.is_port(v)).collect(),
+            reg_output: (0..n).map(|v| search.is_reg_output(v)).collect(),
+            register: (0..n)
+                .map(|v| {
+                    let vx = &g.vertices[v];
+                    match (vx.lib, &vx.cell) {
+                        (Some(l), Some(c)) => g.libs[l].cells.get(c).is_some_and(|c| c.is_sequential()),
+                        _ => false,
+                    }
+                })
+                .collect(),
+            from_ok: (0..n).map(|v| search.pred0_from(v)).collect(),
+            to_ok: (0..n).map(|v| search.pred0_to(v)).collect(),
+            edges: (0..g.edges.len()).map(|e| (g.edges[e].from, g.edges[e].to, search.comb_logic_thru(e))).collect(),
+            in_edges: g.in_edges.clone(),
+            out_edges: g.out_edges.clone(),
+            unconstrained: Vec::new(),
+            unclocked: (0..n).filter(|&v| search.is_reg_clk(v) && !search.has_clock_arrival(v)).collect(),
+        };
+        // `checkUnconstrainedEndpoints` lists only end points, which are already all ends here.
+        f.unconstrained.clear();
+        Ok(f)
+    }
+}

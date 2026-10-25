@@ -18,6 +18,14 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
 # The design database: the cut read out, the re-synthesised gates written back.
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", features = ["gen-write"] }
+# ABC, in process, as the reference links it: `restructure` sources one script per mode.
+vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main" }
+# The timer `restructure` asks: the netlist over the database (grt), the libraries and constraints
+# (rsz), the logic constants (est), the constraint reader (loom).
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", features = ["cli"] }
+vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"] }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"] }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main" }
 
 [[bin]]
 name = "vyges-rmp"
@@ -36,3 +44,24 @@ vyges-opendb = { path = "../vyges-tools-opendb" }
 
 [patch."https://github.com/vyges-tools/opendb-lib.git"]
 vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/abc-lib"]
+vyges-abc-lib = { path = "../vyges-tools-abc-lib" }
+
+[patch."https://github.com/vyges-tools/rsz.git"]
+vyges-rsz = { path = "../vyges-tools-rsz" }
+
+[patch."https://github.com/vyges-tools/grt.git"]
+vyges-grt = { path = "../vyges-tools-grt" }
+
+[patch."https://github.com/vyges-tools/est.git"]
+vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/stt.git"]
+vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }
+
+[patch."https://github.com/vyges-tools/loom.git"]
+vyges-loom = { path = "../vyges-tools-loom" }

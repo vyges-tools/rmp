@@ -5,3 +5,5 @@
 //! the command runs them.
 pub mod cut;
 pub mod design;
+pub mod restructure;
+pub mod timer;
