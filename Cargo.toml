@@ -21,6 +21,8 @@ serde_json = "1"
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 # Liberty: which terminals are clocks, which outputs are constant.
 vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+# The cut a re-synthesis works on: extracted, written to ABC, put back.
+vyges-cut = { git = "https://github.com/vyges-tools/cut", branch = "main" }
 # The design database: the cut read out, the re-synthesised gates written back.
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", features = ["gen-write"] }
 # ABC, in process, as the reference links it: `restructure` sources one script per mode.
@@ -49,6 +51,9 @@ vyges-opendb = { path = "../vyges-tools-opendb" }
 
 [patch."https://github.com/vyges-tools/opendb-lib.git"]
 vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/cut"]
+vyges-cut = { path = "../vyges-tools-cut" }
 
 [patch."https://github.com/vyges-tools/abc-lib"]
 vyges-abc-lib = { path = "../vyges-tools-abc-lib" }

@@ -7,8 +7,10 @@
 // library too, and its `vyges_rmp::…` paths resolve here.
 extern crate self as vyges_rmp;
 
+/// The cut a re-synthesis works on, and its way out to and back from ABC.
+pub use vyges_cut as cut;
+
 pub mod annealing;
-pub mod cut;
 pub mod design;
 pub mod events;
 pub mod genetic;
