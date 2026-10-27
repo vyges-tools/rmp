@@ -36,7 +36,7 @@ jobs:
         run: |
           set -eu
           ref=main
-          for r in sta opendb opendb-lib abc-lib rsz grt est stt dpl loom; do
+          for r in sta opendb opendb-lib abc-lib cut rsz grt est stt dpl loom; do
             git clone -q --depth 1 --branch "$ref" "https://github.com/vyges-tools/$r" "vyges-tools-$r"
             echo "vyges-tools-$r @ $ref $(git -C vyges-tools-$r rev-parse --short HEAD)"
           done
