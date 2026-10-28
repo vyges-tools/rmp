@@ -39,8 +39,8 @@ jobs:
           - { os: macos-15,        target: aarch64-apple-darwin }
           # ubuntu-24.04, not -latest: -latest is rolling to 26.04 (glibc 2.43), and a binary built
           # there binds new symbol versions (log10f@GLIBC_2.43) that 24.04 hosts cannot load.
-          - { os: ubuntu-24.04,    target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}",    target: x86_64-unknown-linux-gnu }
+          - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}-arm", target: aarch64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -85,6 +85,14 @@ jobs:
         run: |
           [ "${{ runner.os }}" = "macOS" ] && export PATH="$(brew --prefix bison)/bin:$PATH"
           cargo build --release --target ${{ matrix.target }}
+      # Runner and glibc floor, one policy for every release: vyges-tools/actions.
+      - name: glibc ceiling
+        uses: vyges-tools/actions/glibc-ceiling@v1
+        with:
+          runner: ${{ matrix.os }}
+          working-directory: vyges-tools-rmp
+          paths: target
+
       - name: Package
         shell: bash
         run: |
@@ -105,7 +113,7 @@ jobs:
   release:
     name: publish release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     steps:
       - uses: actions/download-artifact@v8
         with:
