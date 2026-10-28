@@ -87,13 +87,43 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "`blif-write` and `blif-read` are built (the cut's BLIF, arrivals and requireds not written); `restructure` (both targets), `resynth`, `resynth-annealing` and `resynth-genetic` are built; `run` refuses with exit 3.",
     "restructure matches the reference at pin 27288f5 on 3 of 3 regression cases (area and timing targets): the database (Verilog and DEF), the cut BLIF with its arrival and required times, and the log, byte for byte.",
-    "resynth matches the reference at pin 27288f5 on 10 of 10 regression calls, and resynth-annealing and resynth-genetic on 5 of 5: the database (Verilog and DEF) and the log, byte for byte."
+    "resynth matches the reference at pin 27288f5 on 10 of 10 regression calls, and resynth-annealing and resynth-genetic on 5 of 5: the database (Verilog and DEF) and the log, byte for byte.",
+    "The described call is `restructure`: the design's logic re-synthesised through ABC for area (the default) or timing, and the database written to `out`. One Liberty is both timed and mapped onto (`--liberty` and `--liberty-file` take the same file); more libraries, a wire RC estimate and the resynth commands need the engine's own arguments.",
+    "`restructure` prints its log and writes the database; it has no --json output (a --json is refused as an unknown option, exit 2), so emits_json is false and the result is the printed log.",
+    "Restructuring establishes no claim about the design: the assertion is not_applicable. Without both tie cells (`tielo_port`, `tiehi_port`) cells with constant outputs are not removed, and a warning is printed for each one not given. `--slack-threshold` is accepted and has no effect on `restructure`, so it is not described. Intermediate files go to `work_dir`, the working directory when it is not given.",
+    "input_hash covers the argument vector, not the content of the database, Liberty or SDC it names."
   ],
-  "invocation": { "args_template": ["run"], "emits_json": true },
-  "inputs": { "type": "object", "properties": {} },
-  "artifacts": [],
-  "assertion": { "id": "rmp-ok", "field": "status", "pass_when": { "eq": "ok" } },
-  "consumes": []
+  "invocation": {
+    "args_template": ["restructure", "{design}", "--liberty", "{liberty}", "--liberty-file", "{liberty}", "--sdc", "{sdc}", "-o", "{out}"],
+    "optional": [
+      { "arg": "target", "flag": "--target" },
+      { "arg": "tielo_port", "flag": "--tielo-port" },
+      { "arg": "tiehi_port", "flag": "--tiehi-port" },
+      { "arg": "depth_threshold", "flag": "--depth-threshold" },
+      { "arg": "work_dir", "flag": "--work-dir" },
+      { "arg": "abc_logfile", "flag": "--abc-logfile" }
+    ],
+    "emits_json": false
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["design", "liberty", "sdc", "out"],
+    "properties": {
+      "design": { "type": "string", "description": "design database (.odb) to restructure" },
+      "liberty": { "type": "string", "description": "Liberty library (.lib): timed against and mapped onto" },
+      "sdc": { "type": "string", "description": "timing constraints (.sdc)" },
+      "out": { "type": "string", "description": "database (.odb) to write" },
+      "target": { "type": "string", "enum": ["area", "timing"], "description": "optimise for area (default) or timing" },
+      "tielo_port": { "type": "string", "description": "tie-low cell output as CELL/PORT, e.g. LOGIC0_X1/Z" },
+      "tiehi_port": { "type": "string", "description": "tie-high cell output as CELL/PORT, e.g. LOGIC1_X1/Z" },
+      "depth_threshold": { "type": "integer", "description": "timing target: the first end point whose worst path is deeper than this many levels is restructured (default 16)" },
+      "work_dir": { "type": "string", "description": "directory for the intermediate BLIF and ABC files (default: the working directory)" },
+      "abc_logfile": { "type": "string", "description": "file to write ABC's log to" }
+    }
+  },
+  "artifacts": [ { "role": "odb", "from_arg": "out" } ],
+  "assertion": { "id": "rmp-restructured", "not_applicable": true },
+  "consumes": ["odb", "liberty", "sdc"]
 }"#;
 
 fn refuse(what: &str) -> ExitCode {
@@ -678,8 +708,38 @@ mod tests {
         // Anything else is read as `discovered` and every verdict becomes `unknown`.
         let m = d["maturity"].as_str().unwrap();
         assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
-        // `eq` is the schema's predicate; `equals` is dropped at runtime and the verdict is unknown.
-        assert_eq!(d["assertion"]["pass_when"]["eq"], "ok");
+        // Restructuring is a transform: it makes no claim a verdict could be read from.
+        assert_eq!(d["assertion"]["not_applicable"], true);
+
+        // Rule: the command an MCP caller is handed is one this build answers. Called with no
+        // arguments a built command is a usage error (2); a refused one is exit 3.
+        let inv = &d["invocation"];
+        let template: Vec<&str> = inv["args_template"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+        assert!(COMMANDS.contains(&template[0]), "{}", template[0]);
+        assert_ne!(run(&[template[0].to_string()]), ExitCode::from(3), "`{}` is refused", template[0]);
+        // The command takes no --json (an unknown option, exit 2), so none may be appended.
+        assert_eq!(inv["emits_json"], false);
+        // Rule: a `{token}` is a required input, and every optional is a declared input.
+        let props = d["inputs"]["properties"].as_object().unwrap();
+        let required: Vec<&str> = d["inputs"]["required"].as_array().expect("inputs name their required parameters").iter().map(|r| r.as_str().unwrap()).collect();
+        let tokens: Vec<&str> = template.iter().filter_map(|t| t.strip_prefix('{').and_then(|t| t.strip_suffix('}'))).collect();
+        assert!(!tokens.is_empty(), "the command needs its inputs");
+        for t in &tokens {
+            assert!(required.contains(t) && props.contains_key(*t), "{t}");
+        }
+        for r in &required {
+            assert!(tokens.contains(r), "required `{r}` is never passed");
+        }
+        for o in inv["optional"].as_array().into_iter().flatten() {
+            assert!(props.contains_key(o["arg"].as_str().unwrap()) && o["flag"].is_string(), "{o}");
+        }
+        // Rule: an artifact without `field`/`from_arg` is dropped by the registry without a word.
+        let artifacts = d["artifacts"].as_array().unwrap();
+        assert!(!artifacts.is_empty(), "the database written is the point of the call");
+        for a in artifacts {
+            assert!(a["role"].is_string() && a["from_arg"].as_str().is_some_and(|f| props.contains_key(f)), "{a}");
+        }
+        assert!(!d["consumes"].as_array().unwrap().is_empty());
     }
 
     #[test]
