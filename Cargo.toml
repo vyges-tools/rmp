@@ -1,6 +1,6 @@
 [package]
 name = "vyges-rmp"
-version = "0.1.48"
+version = "0.1.49"
 edition = "2021"
 description = "Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence."
 license = "Apache-2.0"
