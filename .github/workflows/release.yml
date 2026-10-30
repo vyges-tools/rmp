@@ -36,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-15,        target: aarch64-apple-darwin }
+          - { os: "macos-${{ vars.VYGES_MACOS_VERSION || '15' }}",        target: aarch64-apple-darwin }
           # ubuntu-24.04, not -latest: -latest is rolling to 26.04 (glibc 2.43), and a binary built
           # there binds new symbol versions (log10f@GLIBC_2.43) that 24.04 hosts cannot load.
           - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}",    target: x86_64-unknown-linux-gnu }
