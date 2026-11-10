@@ -1,5 +1,7 @@
 # vyges-rmp
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 Logic restructuring on an AIG: re-synthesis of timing-critical or area-heavy logic, with every rewrite checkable for equivalence.
 
 > **Status: in development.** `restructure` (area and timing targets), `resynth` (delay re-mapping of the
