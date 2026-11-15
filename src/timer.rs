@@ -209,15 +209,15 @@ impl TimerEnv for Timer {
         };
         let required = |v: usize| -> [f32; 2] { [vyges_sta::liberty::RISE, vyges_sta::liberty::FALL].map(|rf| finite(search.required_rf(v, rf, vyges_sta::liberty::MAX))) };
         let mut f = Facts {
-            pin: g.vertices.iter().map(|v| v.name.clone()).collect(),
-            inst: (0..n).map(|v| if g.is_port(v) { None } else { g.vertices[v].name.rsplit_once('/').map(|(i, _)| i.to_string()) }).collect(),
+            pin: (0..n).map(|v| g.vname(v)).collect(),
+            inst: (0..n).map(|v| if g.is_port(v) { None } else { g.vname(v).rsplit_once('/').map(|(i, _)| i.to_string()) }).collect(),
             endpoint: (0..n).map(|v| search.is_endpoint(v)).collect(),
             port: (0..n).map(|v| g.is_port(v)).collect(),
             reg_output: (0..n).map(|v| search.is_reg_output(v)).collect(),
             register: (0..n)
                 .map(|v| {
                     let vx = &g.vertices[v];
-                    match (vx.lib, &vx.cell) {
+                    match (vx.lib, vx.cell.as_deref()) {
                         (Some(l), Some(c)) => g.libs[l].cells.get(c).is_some_and(|c| c.is_sequential()),
                         _ => false,
                     }
